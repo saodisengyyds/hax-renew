@@ -25,6 +25,7 @@ HH 自动续期
   FORCE_RENEW=1         忽略到期日，强制续期
 """
 
+import io
 import os
 import re
 import sys
@@ -381,6 +382,24 @@ def dump_page(sb, tag):
     if not DUMP_PAGE:
         return
     print(f"\n===== DUMP [{tag}] =====")
+
+    # 完整 HTML 落盘，供 artifact 下载后分析
+    try:
+        html = sb.get_page_source() or ""
+        fn = f"dump-{tag}.html"
+        with io.open(fn, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"  📄 已保存完整 HTML: {fn}（{len(html)} 字符）")
+        # 顺便统计关键信息
+        low = html.lower()
+        print(f"  <input> 出现: {low.count('<input')} 次")
+        print(f"  <form>  出现: {low.count('<form')} 次")
+        print(f"  <iframe>出现: {low.count('<iframe')} 次")
+        print(f"  'phone' 出现: {low.count('phone')} 次")
+        print(f"  'turnstile' 出现: {low.count('turnstile')} 次")
+        print(f"  'short ad' 出现: {low.count('short ad')} 次")
+    except Exception as e:
+        print(f"  ⚠️ 保存 HTML 失败: {e}")
     try:
         print(f"URL   : {sb.get_current_url()}")
         print(f"TITLE : {sb.get_title()}")

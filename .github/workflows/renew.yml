@@ -119,8 +119,17 @@ jobs:
           retention-days: 1
           if-no-files-found: ignore
 
+      - name: 📄 上传页面 HTML（诊断用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-dumps
+          path: 'dump-*.html'
+          retention-days: 3
+          if-no-files-found: ignore
+
       - name: 📸 上传失败截图
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots
