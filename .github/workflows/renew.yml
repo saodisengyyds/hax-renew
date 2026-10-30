@@ -119,12 +119,16 @@ jobs:
           retention-days: 1
           if-no-files-found: ignore
 
-      - name: 📄 上传页面 HTML（诊断用）
+      - name: 📄 上传诊断文件
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: page-dumps
-          path: 'dump-*.html'
+          name: diag
+          path: |
+            dump-*.html
+            step-*.html
+            step-*.png
+            steps.log
           retention-days: 3
           if-no-files-found: ignore
 

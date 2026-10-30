@@ -781,7 +781,10 @@ def login(sb, tg_wait: int = 300) -> bool:
     time.sleep(5)
 
     _wait_ready(sb, 40)
+    _step(sb, "01-open-login")
+
     _pass_ad_wall(sb, rounds=3)
+    _step(sb, "02-after-adwall")
 
     if _is_logged_in(sb):
         print("✅ 已有登录态")
@@ -791,6 +794,7 @@ def login(sb, tg_wait: int = 300) -> bool:
     # ---- 情况 A：有手机号表单 ----
     n_inputs = _count_inputs(sb)
     print(f"🔎 页面 input 数量: {n_inputs}")
+    _step(sb, f"03-inputs-{n_inputs}")
 
     if n_inputs > 0:
         print("→ 走手机号表单流程")
@@ -798,7 +802,9 @@ def login(sb, tg_wait: int = 300) -> bool:
 
     # ---- 情况 B：没有 input，先尝试点 Login 链接 ----
     print("→ 没有输入框，尝试点击 Login 入口…")
+    _step(sb, "04-before-click-login")
     if _click_login_entry(sb):
+        _step(sb, "05-after-click-login")
         # 等表单出现
         for _ in range(20):
             time.sleep(1)
@@ -810,6 +816,7 @@ def login(sb, tg_wait: int = 300) -> bool:
 
     # ---- 情况 C：Telegram widget ----
     print("→ 尝试 Telegram widget 流程")
+    _step(sb, "06-telegram-fallback")
     return _login_by_telegram(sb, tg_wait)
 
 
@@ -846,6 +853,27 @@ def _click_login_entry(sb) -> bool:
         pass
 
     return False
+
+
+def _step(sb, name: str):
+    """记录步骤：打印 + 落盘 + 截图，便于卡住时定位"""
+    print(f"\n===== STEP: {name} =====")
+    try:
+        with io.open("steps.log", "a", encoding="utf-8") as f:
+            f.write(f"{now_cst().strftime('%H:%M:%S')} {name} "
+                    f"url={sb.get_current_url()}\n")
+    except Exception:
+        pass
+    try:
+        sb.save_screenshot(f"step-{name.replace('/', '_')[:40]}.png")
+    except Exception:
+        pass
+    try:
+        with io.open(f"step-{name.replace('/', '_')[:40]}.html", "w",
+                     encoding="utf-8") as f:
+            f.write(sb.get_page_source() or "")
+    except Exception:
+        pass
 
 
 def _click_submit(sb):
