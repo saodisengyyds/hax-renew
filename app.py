@@ -1174,16 +1174,58 @@ def _login_by_telegram(sb, tg_wait: int) -> bool:
     }})();
     """
 
-    for attempt in range(15):
+    # 先用原生 send_keys（能触发页面自己的 input 监听，比赋 value 更真）
+    for attempt in range(8):
         try:
-            ok = sb.execute_script(js_code)
-            if ok:
-                print(f"  ✅ 成功填入并提交手机号: {ok}")
+            code_el = sb.find_element('#login-phone-code', timeout=2)
+            phone_el = sb.find_element('#login-phone', timeout=2)
+            if code_el and phone_el and code_el.is_displayed():
+                code_el.clear()
+                code_el.send_keys(country_code)
+                time.sleep(0.3)
+                phone_el.clear()
+                phone_el.send_keys(number)
+                time.sleep(0.8)
+                print(f"  ✅ 原生填入 +{country_code} {number}")
+
+                # 提交
+                clicked = False
+                for sel in ['button#check-button', 'button.btn-primary',
+                            'button[type="submit"]']:
+                    try:
+                        b = sb.find_element(sel, timeout=2)
+                        if b and b.is_displayed():
+                            _click_el(sb, b)
+                            print(f"  🖱️  点击提交: {sel}")
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    try:
+                        phone_el.send_keys("\n")
+                        print("  ⌨️  回车提交")
+                    except Exception:
+                        pass
+
                 phone_filled = True
                 break
-        except Exception as e:
-            print(f"  ⚠️ 执行 JS 尝试 {attempt+1}: {e}")
+        except Exception:
+            pass
         time.sleep(1)
+
+    # 原生不行再走 JS
+    if not phone_filled:
+        for attempt in range(10):
+            try:
+                ok = sb.execute_script(js_code)
+                if ok:
+                    print(f"  ✅ JS 填入并提交: {ok}")
+                    phone_filled = True
+                    break
+            except Exception as e:
+                print(f"  ⚠️  JS 尝试 {attempt+1}: {str(e)[:80]}")
+            time.sleep(1)
 
     if not phone_filled:
         phone_sels = [
