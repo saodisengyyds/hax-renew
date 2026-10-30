@@ -67,17 +67,36 @@ jobs:
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
             python3 app.py
 
-      - name: 💾 提交到期日状态
+      - name: 💾 提交状态 + 心跳（防 60 天停用）
         if: always()
         run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 1) 到期日有变化就暂存
           if [ -f hh_state.json ]; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
             git add hh_state.json
-            if ! git diff --cached --quiet; then
-              git commit -m "chore: 更新到期日 $(cat hh_state.json | tr -d '\n')"
-              git push || true
-            fi
+          fi
+
+          # 2) GitHub 规则：公开仓库 60 天无提交 → 定时任务自动停用
+          #    距上次提交超过 25 天就补一次心跳，永远碰不到 60 天线
+          last=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+          now=$(date +%s)
+          days=$(( (now - last) / 86400 ))
+          echo "距上次提交: ${days} 天"
+
+          if [ "$days" -ge 25 ]; then
+            printf 'keepalive %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > .keepalive
+            git add .keepalive
+            echo "⏰ 已触发心跳提交"
+          fi
+
+          if git diff --cached --quiet; then
+            echo "ℹ️ 无变化，跳过提交"
+          else
+            git commit -m "chore: 自动更新 $(date -u +%Y-%m-%d)"
+            git push || true
+            echo "✅ 已提交"
           fi
 
       - name: 📸 上传失败截图
