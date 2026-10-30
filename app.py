@@ -1459,6 +1459,28 @@ def renew(sb):
 
     # 7. 提交续期按钮
     print("🖱️  提交续期…")
+    _pass_ad_wall(sb)
+    # 关闭可能弹出的全屏全页插屏广告（Close 按钮）
+    try:
+        sb.driver.execute_script("""
+        (function(){
+            var frames = document.querySelectorAll('iframe');
+            for(var i=0; i<frames.length; i++){
+                try {
+                    var doc = frames[i].contentDocument || frames[i].contentWindow.document;
+                    var c = doc.querySelector('#dismiss-button, .close-button, [aria-label="Close ad"], [id*="close"]');
+                    if(c) c.click();
+                } catch(e){}
+            }
+            var top_close = document.querySelectorAll('#dismiss-button, [aria-label="Close"], button.close, .close');
+            for(var j=0; j<top_close.length; j++){
+                try { top_close[j].click(); } catch(e){}
+            }
+        })()
+        """)
+        time.sleep(1)
+    except Exception:
+        pass
     submitted = False
     reason = ""
 
@@ -1497,6 +1519,30 @@ def renew(sb):
                     break
         except Exception as e:
             pass
+
+    if not submitted:
+        print("  ⚠️  未直接找到按钮，尝试直接触发表单提交...")
+        try:
+            r = sb.driver.execute_script("""
+            (function(){
+                var f = document.querySelector('form#form-submit') || document.querySelector('form.submit') || document.querySelector('form');
+                if (f) {
+                    if (typeof f.requestSubmit === 'function') {
+                        f.requestSubmit();
+                        return 'requestSubmit';
+                    }
+                    f.submit();
+                    return 'submit';
+                }
+                return 'no_form';
+            })()
+            """)
+            if r in ('requestSubmit', 'submit'):
+                submitted = True
+                reason = f"form_{r}"
+                print(f"  ✅ 表单直接提交成功: {r}")
+        except Exception as e:
+            print(f"  ⚠️ 表单兜底提交异常: {e}")
 
     if not submitted:
         print("❌ 无法定位提交按钮")
