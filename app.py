@@ -575,100 +575,119 @@ def _count_inputs(sb) -> int:
 
 def _pass_ad_wall(sb, rounds: int = 3) -> bool:
     """
-    广告墙：页面只有「View a short ad」之类的按钮，没有登录表单。
-    点掉后等页面出现真实表单。
+    广告墙是 Google Funding Choices（fc-dialog 结构）：
+      div.fc-dialog-overlay
+        button.fc-rewarded-ad-button  ← "View a short ad"
     """
     any_clicked = False
 
     for r in range(rounds):
-        txt = _body_text(sb).lower()
-        if not txt:
-            time.sleep(2)
-            txt = _body_text(sb).lower()
+        # 判断有没有广告墙
+        has_wall = False
+        try:
+            has_wall = bool(sb.find_elements("css selector", ".fc-dialog-overlay, .fc-message-root"))
+        except Exception:
+            pass
 
-        has_form = _has_login_form(sb)
-        has_kw = any(k in txt for k in AD_WALL_KWS)
+        if not has_wall:
+            try:
+                txt = (_body_text(sb) or "").lower()
+                has_wall = "short ad" in txt or "site-wide access" in txt
+            except Exception:
+                pass
 
-        if not has_kw and has_form:
-            return any_clicked
-
-        if not has_kw and not has_form:
-            # 既没关键词也没表单 —— 可能是 CF 或空页，交给上层处理
+        if not has_wall:
             return any_clicked
 
         print(f"📺 广告墙（第 {r+1} 轮），尝试点击…")
-
         clicked = False
 
-        # 1) 按文本找可点元素（button / a / span / div / input[type=submit]）
+        # 1) 精确点 fc-rewarded-ad-button
         try:
-            clicked = bool(sb.execute_script(r"""
-            (function(){
-              var kws=['view a short ad','short ad','site-wide access',
-                       'watch ad','sponsored','continue to site','看广告'];
-              var all=document.querySelectorAll('button,a,span,div,input[type=submit]');
-              for(var i=0;i<all.length;i++){
-                var el=all[i];
-                var t=(el.innerText||el.value||'').toLowerCase().trim();
-                if(!t) continue;
-                for(var k=0;k<kws.length;k++){
-                  if(t.indexOf(kws[k])>=0){
-                    try{ el.scrollIntoView({block:'center'}); }catch(e){}
-                    el.click();
-                    var ev=new MouseEvent('click',{bubbles:true,cancelable:true,view:window});
-                    el.dispatchEvent(ev);
-                    return true;
-                  }
-                }
-              }
-              return false;})()
-            """))
+            btns = sb.find_elements("css selector", ".fc-rewarded-ad-button")
+            if btns:
+                btn = btns[0]
+                sb.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", btn)
+                time.sleep(0.5)
+                try:
+                    btn.click()
+                except Exception:
+                    sb.driver.execute_script("arguments[0].click();", btn)
+                clicked = True
+                print("  🖱️  点击 .fc-rewarded-ad-button")
         except Exception as e:
-            print(f"  ⚠️  JS 点击失败: {str(e)[:80]}")
+            print(f"  ⚠️  精确点击失败: {str(e)[:70]}")
 
-        # 2) 兜底：用 Selenium 逐个元素点
+        # 2) 按文本找
         if not clicked:
             try:
-                for sel in ["button", "a", "input[type=submit]"]:
-                    for el in sb.find_elements(sel):
-                        try:
-                            t = (el.text or "").strip().lower()
-                            if t and any(k in t for k in AD_WALL_KWS):
-                                el.click()
-                                clicked = True
-                                print(f"  🖱️  {t[:40]}")
-                                break
-                        except Exception:
-                            continue
-                    if clicked:
-                        break
+                for el in sb.find_elements("css selector",
+                                           ".fc-dialog-overlay button, .fc-message-root button"):
+                    try:
+                        t = (el.text or "").lower()
+                        if "ad" in t or "access" in t or "continue" in t:
+                            el.click()
+                            clicked = True
+                            print(f"  🖱️  {t[:40]}")
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # 3) JS 兜底
+        if not clicked:
+            try:
+                clicked = bool(sb.execute_script(r"""
+                (function(){
+                  var b=document.querySelector('.fc-rewarded-ad-button');
+                  if(b){ b.click(); return true; }
+                  var all=document.querySelectorAll('button');
+                  for(var i=0;i<all.length;i++){
+                    var t=(all[i].innerText||'').toLowerCase();
+                    if(t.indexOf('short ad')>=0||t.indexOf('site-wide')>=0){
+                      all[i].click(); return true;
+                    }
+                  }
+                  return false;})()
+                """))
+                if clicked:
+                    print("  🖱️  JS 点击")
             except Exception:
                 pass
 
         if clicked:
             any_clicked = True
-            print("  ⏳ 等待广告跳转…")
+            print("  ⏳ 等待广告流程…")
             # 广告可能开新标签
             try:
                 handles = sb.driver.window_handles
                 if len(handles) > 1:
-                    print(f"  🔀 检测到 {len(handles)} 个标签页，切回第一个")
-                    sb.driver.switch_to.window(handles[0])
+                    main = handles[0]
+                    sb.driver.switch_to.window(main)
                     for h in handles[1:]:
                         try:
                             sb.driver.switch_to.window(h)
                             sb.driver.close()
                         except Exception:
                             pass
-                    sb.driver.switch_to.window(handles[0])
+                    sb.driver.switch_to.window(main)
+                    print("  🔀 已关闭广告标签页")
             except Exception:
                 pass
 
-            time.sleep(10)
-            # 等表单出现
-            for _ in range(20):
-                if _has_login_form(sb):
-                    print("  ✅ 表单已出现")
+            time.sleep(12)
+            # 等广告墙消失
+            for _ in range(25):
+                still = False
+                try:
+                    still = bool(sb.find_elements(
+                        "css selector", ".fc-dialog-overlay, .fc-message-root"))
+                except Exception:
+                    pass
+                if not still:
+                    print("  ✅ 广告墙已消失")
                     return True
                 time.sleep(1)
         else:
@@ -744,14 +763,17 @@ def _is_logged_in(sb):
 
 # ==================== 登录 ====================
 
-def login(sb, tg_wait: int = 240) -> bool:
+def login(sb, tg_wait: int = 300) -> bool:
     """
-    登录流程：
-      1. 打开 /login
-      2. 填手机号 → 提交
-      3. 从邮箱取验证码 → 填入 → 提交
-      4. 页面可能要求 TG 确认 —— 推通知给你，等你点
-      5. 轮询等待登录完成，成功后保存 cookie
+    hax 的登录是 Telegram OAuth Widget（不是手机号表单）。
+
+    流程：
+      1. 打开 /login，点掉广告墙
+      2. 找到 telegram-login iframe，点进去
+      3. 弹出 Telegram 授权页 —— 需要手机 App 确认
+      4. 推 TG 通知提醒你点确认
+      5. 轮询等待回跳到 hax.co.id 且已登录
+      6. 成功后保存 cookie
     """
     print(f"\n🌐 打开登录页: {login_url()}")
     try:
@@ -768,138 +790,133 @@ def login(sb, tg_wait: int = 240) -> bool:
         save_cookies(sb)
         return True
 
-    if not _has_login_form(sb):
-        print("⚠️  没有登录表单，再打一轮广告墙…")
-        _pass_ad_wall(sb, rounds=3)
+    # ---- 找 Telegram 登录 widget ----
+    print("🔎 查找 Telegram 登录按钮…")
+    tg_frame = None
+    try:
+        for ifr in sb.find_elements("iframe"):
+            try:
+                src = ifr.get_attribute("src") or ""
+                fid = ifr.get_attribute("id") or ""
+                if "oauth.telegram.org" in src or "telegram-login" in fid:
+                    tg_frame = ifr
+                    print(f"  ✅ 找到 widget: id={fid}")
+                    print(f"     src={src[:120]}")
+                    break
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"  ⚠️  查找 iframe 失败: {e}")
 
-    dump_page(sb, "login")
-
-    # ---- 填手机号 ----
-    phone_sels = [
-        'input[name="phone"]', 'input[id="phone"]',
-        'input[type="tel"]', 'input[name="mobile"]',
-        'input[name="username"]', 'input[id="text"]',
-        'input[type="text"]', 'input[type="email"]',
-    ]
-    if not _fill(sb, phone_sels, PHONE, "手机号"):
-        dump_page(sb, "no-phone-input")
-        return False
-    time.sleep(1)
-
-    # ---- 提交 ----
-    print("🖱️  提交手机号…")
-    _click_submit(sb)
-    time.sleep(6)
-    _wait_ready(sb, 20)
-    _pass_ad_wall(sb, rounds=2)
-
-    # ---- 验证码 ----
-    token = fetch_code(max_wait=180, interval=8)
-    if not token:
-        send_tg("❌", "取不到验证码", "检查 IMAP 配置或邮件主题关键词")
+    if not tg_frame:
+        print("❌ 没有找到 Telegram 登录 widget")
+        dump_page(sb, "no-tg-widget")
+        send_tg("❌", "找不到 Telegram 登录按钮",
+                "页面结构可能变了，请查看 artifact 里的 HTML")
         return False
 
-    code_sels = [
-        'input[name="code"]', 'input[id="code"]',
-        'input[name="token"]', 'input[id="token"]',
-        'input[name*="verify"]', 'input[id*="verify"]',
-        'input[name*="otp"]', 'input[id*="otp"]',
-        'input[type="text"]',
-    ]
-    if not _fill(sb, code_sels, token, "验证码"):
-        dump_page(sb, "no-code-input")
-        return False
-    time.sleep(1)
+    # ---- 点它 ----
+    print("🖱️  点击 Telegram 登录…")
+    clicked = False
+    try:
+        tg_frame.click()
+        clicked = True
+    except Exception as e:
+        print(f"  ⚠️  直接点击失败: {str(e)[:80]}")
 
-    print("🖱️  提交验证码…")
-    _click_submit(sb)
+    if not clicked:
+        # 用坐标点
+        try:
+            loc = tg_frame.location
+            size = tg_frame.size
+            x = loc["x"] + size["width"] / 2
+            y = loc["y"] + size["height"] / 2
+            sb.driver.execute_script(
+                f"window.scrollTo(0, {max(0, y - 300)});")
+            time.sleep(0.5)
+            print(f"  🖱️  坐标点击 ({x:.0f}, {y:.0f})")
+            from selenium.webdriver.common.action_chains import ActionChains
+            ActionChains(sb.driver).move_by_offset(x, y).click().perform()
+            clicked = True
+        except Exception as e:
+            print(f"  ⚠️  坐标点击失败: {str(e)[:80]}")
+
+    if not clicked:
+        print("❌ 点不动 Telegram 按钮")
+        return False
+
     time.sleep(5)
 
-    # ---- 等 TG 确认 ----
-    print("\n" + "=" * 50)
-    print("  可能需要手机 Telegram 确认")
-    print("=" * 50)
+    # ---- 通知你 ----
+    print("\n" + "=" * 52)
+    print("   需要你在手机上确认 Telegram 登录")
+    print("=" * 52)
     send_tg(
         "📲",
         "请在手机上确认登录",
-        f"hax 登录需要 Telegram 确认，请在 {tg_wait} 秒内点击确认",
+        f"已点击 Telegram 登录按钮，请在 {tg_wait} 秒内\n"
+        f"打开 Telegram 点击确认授权",
     )
 
-    print(f"⏳ 等待登录完成（最多 {tg_wait}s，期间请在手机上点 TG 确认）…")
+    # ---- 等回跳 ----
+    print(f"⏳ 等待授权完成（最多 {tg_wait}s）…")
     deadline = time.time() + tg_wait
     last_report = 0
+
     while time.time() < deadline:
         time.sleep(3)
 
+        # 可能在多个窗口之间切换
+        try:
+            handles = sb.driver.window_handles
+            if len(handles) > 1:
+                cur = sb.driver.current_window_handle
+                # 切到新窗口看看
+                for h in handles:
+                    if h != cur:
+                        sb.driver.switch_to.window(h)
+                        break
+        except Exception:
+            pass
+
+        cur_url = ""
+        try:
+            cur_url = sb.get_current_url() or ""
+        except Exception:
+            pass
+
+        if "hax.co.id" in cur_url and "/login" not in cur_url:
+            print(f"✅ 已回跳: {cur_url}")
+            # 切回 hax 窗口
+            try:
+                handles = sb.driver.window_handles
+                for h in handles:
+                    sb.driver.switch_to.window(h)
+                    if "hax.co.id" in (sb.get_current_url() or ""):
+                        break
+            except Exception:
+                pass
+            time.sleep(2)
+            if _is_logged_in(sb):
+                print("✅ 登录成功！")
+                save_cookies(sb)
+                return True
+
+        # 直接判断登录态（同窗口回跳的情况）
         if _is_logged_in(sb):
             print("✅ 登录成功！")
             save_cookies(sb)
             return True
 
-        # 每 30 秒报一次进度
         remain = int(deadline - time.time())
         if remain // 30 != last_report:
             last_report = remain // 30
-            cur = sb.get_current_url() or ""
-            print(f"   等待中… 剩余 {remain}s  URL={cur}")
+            print(f"   等待中… 剩余 {remain}s  URL={cur_url[:70]}")
 
-        # 顺便再打一次广告墙
-        try:
-            _pass_ad_wall(sb, rounds=1)
-        except Exception:
-            pass
-
-    # 超时
-    print("❌ 等待登录超时")
-    dump_page(sb, "login-timeout")
-    send_tg("⏰", "登录超时", "没有检测到登录成功，请检查是否需要手动确认")
-    return False
-
-
-def _click_submit(sb):
-    """点提交按钮：先按常见选择器，再按文本，最后按回车"""
-    try:
-        for sel in ['button[name="submit_button"]', 'button[type="submit"]',
-                    'input[type="submit"]']:
-            try:
-                btn = sb.find_element(sel, timeout=2)
-                if btn and btn.is_displayed():
-                    btn.click()
-                    print(f"  🖱️  {sel}")
-                    return True
-            except Exception:
-                continue
-
-        ok = sb.execute_script(r"""
-        (function(){
-          var bs=document.querySelectorAll('button,input[type=submit],a.btn');
-          for(var i=0;i<bs.length;i++){
-            var t=(bs[i].innerText||bs[i].value||'').toLowerCase();
-            if(/send|submit|verify|login|continue|next|confirm|验证码|发送|下一步|登录|确认/.test(t)){
-              bs[i].click(); return true;
-            }
-          }
-          return false;})()
-        """)
-        if ok:
-            print("  🖱️  按文本点击")
-            return True
-    except Exception:
-        pass
-
-    # 回车兜底
-    try:
-        for sel in ['input[type="text"]', 'input[type="tel"]', 'input[type="password"]']:
-            try:
-                el = sb.find_element(sel, timeout=1)
-                if el and el.is_displayed():
-                    el.send_keys("\n")
-                    print("  ⌨️  回车提交")
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
+    print("❌ 等待授权超时")
+    dump_page(sb, "tg-timeout")
+    send_tg("⏰", "登录超时",
+            f"没有检测到授权完成。如果手机上没收到确认，请重新运行")
     return False
 
 
