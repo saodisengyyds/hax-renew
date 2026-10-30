@@ -801,18 +801,26 @@ def login(sb, tg_wait: int = 300) -> bool:
         return _login_by_phone(sb, tg_wait)
 
     # ---- 情况 B：没有 input，先尝试点 Login 链接 ----
-    print("→ 没有输入框，尝试点击 Login 入口…")
+    print("→ 没有输入框，点击 Login 打开弹窗…")
     _step(sb, "04-before-click-login")
     if _click_login_entry(sb):
         _step(sb, "05-after-click-login")
-        # 等表单出现
-        for _ in range(20):
+
+        # 等弹窗里的表单出现
+        print("  ⏳ 等弹窗加载…")
+        for i in range(30):
             time.sleep(1)
-            if _count_inputs(sb) > 0:
-                print("  ✅ 表单已出现")
+            n = _count_inputs(sb)
+            if n > 0:
+                print(f"  ✅ 弹窗表单已出现（{i+1}s，{n} 个输入框）")
+                _step(sb, f"05b-modal-{n}-inputs")
                 return _login_by_phone(sb, tg_wait)
-            _pass_ad_wall(sb, rounds=1)
-        print("  ⚠️  点了 Login 仍无表单")
+            if i % 5 == 0:
+                _pass_ad_wall(sb, rounds=1)
+
+        print("  ⚠️  点了 Login 仍无表单，检查弹窗结构")
+        _step(sb, "05c-modal-no-input")
+        dump_page(sb, "modal-no-input")
 
     # ---- 情况 C：Telegram widget ----
     print("→ 尝试 Telegram widget 流程")
@@ -822,14 +830,30 @@ def login(sb, tg_wait: int = 300) -> bool:
 
 def _click_login_entry(sb) -> bool:
     """点页面上的 Login 入口（导航栏链接或按钮）"""
+    before_url = ""
+    try:
+        before_url = sb.get_current_url() or ""
+    except Exception:
+        pass
+    print(f"  📍 点击前 URL: {before_url}")
+
     # 1) 找 href 含 login 的链接
     try:
         for el in sb.find_elements("css selector", "a[href*='login'], a[href*='Login']"):
             try:
                 if el.is_displayed():
+                    href = el.get_attribute("href") or ""
+                    print(f"  🖱️  点击链接: {href}")
                     el.click()
-                    print(f"  🖱️  点击链接: {el.get_attribute('href')}")
                     time.sleep(4)
+                    after = ""
+                    try:
+                        after = sb.get_current_url() or ""
+                    except Exception:
+                        pass
+                    print(f"  📍 点击后 URL: {after}")
+                    if after != before_url:
+                        print("  ✅ 已跳转")
                     return True
             except Exception:
                 continue
@@ -979,9 +1003,20 @@ def _login_by_phone(sb, tg_wait: int) -> bool:
     """手机号 + 邮箱验证码登录"""
     print("\n📱 手机号登录流程")
 
+    # 弹窗内的手机号输入框：先精确找 modal 里的，再全局找
     phone_sels = [
+        # Bootstrap modal 常见容器
+        '.modal.show input[name="phone"]',
+        '.modal.show input[type="tel"]',
+        '.modal.show input[type="text"]',
+        '.modal-content input[type="tel"]',
+        '.modal-content input[type="text"]',
+        '.modal-dialog input[type="tel"]',
+        '#loginModal input[type="tel"]',
+        # 通用
         'input[name="phone"]', 'input[id="phone"]',
         'input[type="tel"]', 'input[name="mobile"]',
+        'input[placeholder*="phone"]', 'input[placeholder*="手机"]',
         'input[name="username"]', 'input[id="text"]',
         'input[type="text"]', 'input[type="email"]',
     ]
