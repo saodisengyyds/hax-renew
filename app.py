@@ -339,6 +339,47 @@ def dump_page(sb, tag):
             except Exception:
                 pass
 
+        # 无论哪种情况，都单独抓一次表单区域
+        try:
+            forminfo = sb.execute_script(r"""
+            (function(){
+              var out={forms:[],inputs:[],iframes:[],scripts:[],bodyTail:''};
+              document.querySelectorAll('form').forEach(function(f){
+                out.forms.push({action:f.getAttribute('action')||'',
+                                method:f.getAttribute('method')||'',
+                                id:f.id||'',cls:f.className||'',
+                                html:f.outerHTML.slice(0,600)});
+              });
+              document.querySelectorAll('input,textarea,select,button').forEach(function(e){
+                out.inputs.push({tag:e.tagName.toLowerCase(),type:e.getAttribute('type')||'',
+                  name:e.getAttribute('name')||'',id:e.id||'',
+                  ph:e.getAttribute('placeholder')||'',
+                  visible: e.offsetParent!==null});
+              });
+              document.querySelectorAll('iframe').forEach(function(f){
+                out.iframes.push(f.src||'(no src)');
+              });
+              document.querySelectorAll('script[src]').forEach(function(sc){
+                var s=sc.getAttribute('src')||'';
+                if(/login|auth|main|app|index/i.test(s)) out.scripts.push(s);
+              });
+              var b=document.body;
+              if(b) out.bodyTail=(b.innerText||'').slice(-600);
+              return out;})()
+            """)
+            if isinstance(forminfo, dict):
+                print("  FORMS 数:", len(forminfo.get("forms", [])))
+                for f in forminfo.get("forms", []):
+                    print("   FORM:", f)
+                print("  INPUTS 数:", len(forminfo.get("inputs", [])))
+                for i in forminfo.get("inputs", [])[:15]:
+                    print("   IN  :", i)
+                print("  IFRAMES:", forminfo.get("iframes", []))
+                print("  SCRIPTS:", forminfo.get("scripts", []))
+                print("  TAIL  :", forminfo.get("bodyTail", "")[:400])
+        except Exception as e:
+            print("  表单抓取失败:", e)
+
         print("FORMS :", info.get("forms"), "| bodyLen:", info.get("bodyLen"))
         for i in info.get("inputs", []):
             print("  IN ", i)
@@ -388,20 +429,36 @@ def _body_text(sb):
 
 
 def _has_login_form(sb):
-    """页面上有没有手机号输入框"""
+    """页面上有没有可用的输入框（JS 拿不到就用 WebDriver 兜底）"""
     try:
-        return bool(sb.execute_script("""
+        r = sb.execute_script("""
         (function(){
           var sels=['input[name="phone"]','input[id="phone"]','input[type="tel"]',
-                    'input[name="username"]','input[id="text"]','input[type="text"]'];
+                    'input[name="username"]','input[id="text"]','input[type="text"]',
+                    'input[type="email"]','input[type="password"]'];
           for(var i=0;i<sels.length;i++){
             var el=document.querySelector(sels[i]);
             if(el && el.offsetParent!==null) return true;
           }
           return false;})()
-        """))
+        """)
+        if r:
+            return True
     except Exception:
-        return False
+        pass
+
+    # JS 失败时用 WebDriver 直接找
+    try:
+        for sel in ["input", "textarea"]:
+            for el in sb.find_elements(sel):
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
 
 
 def _pass_ad_wall(sb, rounds: int = 3) -> bool:
@@ -510,10 +567,13 @@ def _pass_ad_wall(sb, rounds: int = 3) -> bool:
 
 
 def _fill(sb, selectors, value, label):
+    # 1) 按选择器
     for sel in selectors:
         try:
             el = sb.find_element(sel, timeout=3)
             if not el:
+                continue
+            if not el.is_displayed():
                 continue
             try:
                 el.clear()
@@ -526,6 +586,29 @@ def _fill(sb, selectors, value, label):
             return True
         except Exception:
             continue
+
+    # 2) 兜底：遍历所有可见输入框
+    print(f"  ⚠️  选择器都没命中，尝试遍历输入框填 {label}")
+    try:
+        for sel in ["input", "textarea"]:
+            for el in sb.find_elements(sel):
+                try:
+                    if not (el.is_displayed() and el.is_enabled()):
+                        continue
+                    t = (el.get_attribute("type") or "").lower()
+                    if t in ("hidden", "submit", "button", "checkbox", "radio"):
+                        continue
+                    el.clear()
+                    el.click()
+                    time.sleep(0.2)
+                    el.send_keys(value)
+                    print(f"✏️  {label} (兜底: {sel}, name={el.get_attribute('name')})")
+                    return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
     print(f"❌ 找不到 {label}")
     return False
 
