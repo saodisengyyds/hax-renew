@@ -1146,39 +1146,43 @@ def _login_by_telegram(sb, tg_wait: int) -> bool:
     print(f"  📱 国家代码: +{country_code}, 号码: {number}")
 
     # 用 JS 强力填入并直接调用 Telegram 官方的 requestConfirmation(event)
-    for attempt in range(15):
-        ok = sb.execute_script("""
-        (function(c, n){
-          var codeEl = document.getElementById('login-phone-code');
-          var phoneEl = document.getElementById('login-phone');
-          if (codeEl && phoneEl) {
-            codeEl.value = c;
-            phoneEl.value = n;
-            codeEl.dispatchEvent(new Event('input', {bubbles: true}));
-            codeEl.dispatchEvent(new Event('change', {bubbles: true}));
-            phoneEl.dispatchEvent(new Event('input', {bubbles: true}));
-            phoneEl.dispatchEvent(new Event('change', {bubbles: true}));
-            
-            // 直接触发官方提交函数
-            if (typeof requestConfirmation === 'function') {
-              requestConfirmation(null);
-              return 'submitted_by_fn';
-            }
-            var form = document.getElementById('send-form');
-            if (form) {
-              form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
-              return 'submitted_by_form';
-            }
-            return 'filled';
-          }
-          return false;
-        })(arguments[0], arguments[1]);
-        """, country_code, number)
+    js_code = f"""
+    (function(){{
+      var codeEl = document.getElementById('login-phone-code');
+      var phoneEl = document.getElementById('login-phone');
+      if (codeEl && phoneEl) {{
+        codeEl.value = '{country_code}';
+        phoneEl.value = '{number}';
+        codeEl.dispatchEvent(new Event('input', {{bubbles: true}}));
+        codeEl.dispatchEvent(new Event('change', {{bubbles: true}}));
+        phoneEl.dispatchEvent(new Event('input', {{bubbles: true}}));
+        phoneEl.dispatchEvent(new Event('change', {{bubbles: true}}));
+        
+        // 直接触发官方提交函数
+        if (typeof requestConfirmation === 'function') {{
+          requestConfirmation(null);
+          return 'submitted_by_fn';
+        }}
+        var form = document.getElementById('send-form');
+        if (form) {{
+          form.dispatchEvent(new Event('submit', {{bubbles: true, cancelable: true}}));
+          return 'submitted_by_form';
+        }}
+        return 'filled';
+      }}
+      return false;
+    }})();
+    """
 
-        if ok:
-            print(f"  ✅ 成功填入并提交手机号: {ok}")
-            phone_filled = True
-            break
+    for attempt in range(15):
+        try:
+            ok = sb.execute_script(js_code)
+            if ok:
+                print(f"  ✅ 成功填入并提交手机号: {ok}")
+                phone_filled = True
+                break
+        except Exception as e:
+            print(f"  ⚠️ 执行 JS 尝试 {attempt+1}: {e}")
         time.sleep(1)
 
     if not phone_filled:
