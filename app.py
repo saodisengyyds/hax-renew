@@ -1130,20 +1130,39 @@ def _login_by_telegram(sb, tg_wait: int) -> bool:
     print("🔎 处理手机号输入与提交…")
     phone_filled = False
     clean_phone = re.sub(r'[^0-9+]', '', PHONE)
-    # 分割国家代码和号码
+
+    # 解析成 (国家代码, 本地号码)
+    # 规则：
+    #   +8613800138000   → 86 / 13800138000
+    #   8613800138000    → 86 / 13800138000
+    #   13800138000      → 86 / 13800138000   （11 位、1 开头）
+    #   其他             → 原样，不猜
     country_code = "86"
     number = clean_phone
+
     if clean_phone.startswith("+"):
-        clean_phone = clean_phone[1:]
-    if clean_phone.startswith("86") and len(clean_phone) > 10:
-        country_code = "86"
-        number = clean_phone[2:]
+        rest = clean_phone[1:]
+        if rest.startswith("86") and len(rest) == 13:
+            country_code, number = "86", rest[2:]
+        elif rest.startswith("86") and len(rest) > 13:
+            country_code, number = "86", rest[2:]
+        else:
+            # 其他国家的 +xx，交给页面自己处理
+            country_code, number = "", rest
+    elif clean_phone.startswith("86") and len(clean_phone) == 13:
+        country_code, number = "86", clean_phone[2:]
     elif clean_phone.startswith("1") and len(clean_phone) == 11:
-        # 如果是 1xx 开头的 11 位中国手机号
-        country_code = "86"
-        number = clean_phone
+        country_code, number = "86", clean_phone
+    else:
+        country_code, number = "86", clean_phone
 
     print(f"  📱 国家代码: +{country_code}, 号码: {number}")
+    # 号码合理性检查
+    if country_code == "86" and not re.fullmatch(r'1[3-9]\d{9}', number):
+        print(f"  ⚠️  号码 {number} 不像有效的国内手机号（应为 1[3-9] 开头 11 位）")
+        send_tg("⚠️", "手机号可能有问题",
+                f"解析结果 +{country_code} {number}\n"
+                f"请检查 HH_PHONE 是否填对")
 
     # 用 JS 强力填入并直接调用 Telegram 官方的 requestConfirmation(event)
     js_code = f"""
@@ -1241,57 +1260,21 @@ def _login_by_telegram(sb, tg_wait: int) -> bool:
     time.sleep(4)
     _step(sb, "tg-phone-submitted")
 
-    # ---- 通知 + 等确认 ----
+    # ---- 已提交手机号，到此为止 ----
     print("\n" + "=" * 52)
-    print("   请在手机上确认 Telegram 登录")
+    print("   手机号已提交，Telegram 消息已发送")
     print("=" * 52)
     send_tg(
         "📲",
-        "请在手机上确认登录",
-        f"已提交手机号，请在 {tg_wait} 秒内\n打开 Telegram 点击确认",
+        "已提交手机号",
+        f"解析结果 +{country_code} {number}\n"
+        f"Telegram 已发送确认消息，请在手机上点击确认",
     )
 
-    print(f"⏳ 等待确认（最多 {tg_wait}s）…")
-    deadline = time.time() + tg_wait
-    last_report = 0
-
-    while time.time() < deadline:
-        time.sleep(3)
-
-        # 在所有窗口里找 hax 的登录态
-        try:
-            for h in sb.driver.window_handles:
-                sb.driver.switch_to.window(h)
-                if _is_logged_in(sb):
-                    print("✅ 登录成功！")
-                    save_cookies(sb)
-                    # 关掉多余窗口
-                    try:
-                        for hh in sb.driver.window_handles:
-                            if hh != h:
-                                sb.driver.switch_to.window(hh)
-                                sb.driver.close()
-                        sb.driver.switch_to.window(h)
-                    except Exception:
-                        pass
-                    return True
-        except Exception:
-            pass
-
-        remain = int(deadline - time.time())
-        if remain // 30 != last_report:
-            last_report = remain // 30
-            cur = ""
-            try:
-                cur = sb.get_current_url() or ""
-            except Exception:
-                pass
-            print(f"   等待中… 剩余 {remain}s  URL={cur[:70]}")
-
-    print("❌ 等待确认超时")
-    _step(sb, "tg-timeout")
-    send_tg("⏰", "登录超时", "没检测到确认完成")
-    return False
+    # 保存当前状态供后续复用
+    _step(sb, "tg-phone-sent")
+    print("✅ 手机号提交流程完成")
+    return True
 
 
 # ==================== 续期 ====================
