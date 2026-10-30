@@ -531,36 +531,46 @@ def _body_text(sb):
 
 
 def _has_login_form(sb):
-    """页面上有没有可用的输入框（JS 拿不到就用 WebDriver 兜底）"""
-    try:
-        r = sb.execute_script("""
-        (function(){
-          var sels=['input[name="phone"]','input[id="phone"]','input[type="tel"]',
-                    'input[name="username"]','input[id="text"]','input[type="text"]',
-                    'input[type="email"]','input[type="password"]'];
-          for(var i=0;i<sels.length;i++){
-            var el=document.querySelector(sels[i]);
-            if(el && el.offsetParent!==null) return true;
-          }
-          return false;})()
-        """)
-        if r:
-            return True
-    except Exception:
-        pass
-
-    # JS 失败时用 WebDriver 直接找
+    """页面上有没有可用的输入框（优先 WebDriver，JS 在这个站不可靠）"""
+    # 1) WebDriver 直接找
     try:
         for sel in ["input", "textarea"]:
             for el in sb.find_elements(sel):
                 try:
-                    if el.is_displayed() and el.is_enabled():
-                        return True
+                    if not el.is_displayed():
+                        continue
+                    t = (el.get_attribute("type") or "").lower()
+                    if t in ("hidden",):
+                        continue
+                    return True
                 except Exception:
                     continue
     except Exception:
         pass
+
+    # 2) JS 兜底
+    try:
+        r = sb.execute_script("""
+        (function(){
+          var els=document.querySelectorAll('input,textarea');
+          for(var i=0;i<els.length;i++){
+            if(els[i].offsetParent!==null) return true;
+          }
+          return false;})()
+        """)
+        return bool(r)
+    except Exception:
+        pass
+
     return False
+
+
+def _count_inputs(sb) -> int:
+    """统计页面上 input 数量（诊断用）"""
+    try:
+        return len(sb.find_elements("input"))
+    except Exception:
+        return -1
 
 
 def _pass_ad_wall(sb, rounds: int = 3) -> bool:
