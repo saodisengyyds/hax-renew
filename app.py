@@ -1367,35 +1367,102 @@ def renew(sb):
     # 提交
     print("🖱️  提交续期…")
     submitted = False
-    try:
-        btn = sb.find_element('button[name="submit_button"]', timeout=5)
-        if btn:
-            sb.execute_script("""
+    reason = ""
+
+    # 等 Turnstile 拿到 token（页面是 cf-turnstile，有值才能提交）
+    print("  ⏳ 等 Turnstile token…")
+    for _ in range(20):
+        try:
+            tv = sb.driver.execute_script("""
             (function(){
-              var b=document.querySelector('button[name="submit_button"]');
-              if(b) b.scrollIntoView({behavior:'smooth',block:'center'});})()
+              var el = document.querySelector('input[name="cf-turnstile-response"]');
+              return el && el.value ? el.value.length : 0;
+            })()
             """)
-            time.sleep(0.8)
-            btn.click()
-            submitted = True
-    except Exception:
-        pass
+            if tv and int(tv) > 20:
+                print(f"  ✅ Turnstile 已就绪（{tv} 字符）")
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
+        print("  ⚠️  Turnstile token 可能未就绪，仍尝试提交")
 
-    if not submitted:
-        submitted = sb.execute_script("""
+    # 策略 1：直接调用页面自己的 onSubmit()（button 上有 data-callback="onSubmit"）
+    try:
+        r = sb.driver.execute_script("""
         (function(){
-          var bs=document.querySelectorAll('button,input[type=submit]');
-          for(var i=0;i<bs.length;i++){
-            var t=(bs[i].innerText||bs[i].value||'').toLowerCase();
-            if(/renew|extend|续期/.test(t)){bs[i].click();return true;}
+          if (typeof onSubmit === 'function') {
+            try { onSubmit(); return 'onSubmit'; }
+            catch(e){ return 'onSubmit_err:' + e.message; }
           }
-          return false;})()
+          return '';
+        })()
         """)
+        if r == 'onSubmit':
+            submitted = True
+            reason = 'onSubmit()'
+        elif r:
+            reason = str(r)
+    except Exception as e:
+        reason = str(e)[:60]
+
+    # 策略 2：JS 直接点按钮（绕过广告遮罩，按钮无文字所以不按文本找）
+    if not submitted:
+        try:
+            r = sb.driver.execute_script("""
+            (function(){
+              var bs = document.querySelectorAll('button[name="submit_button"]');
+              if (!bs.length) return 'no_button';
+              // 优先选没有 data-callback 的那个（普通提交）
+              var target = null;
+              for (var i = 0; i < bs.length; i++) {
+                if (!bs[i].hasAttribute('data-callback')) target = bs[i];
+              }
+              if (!target) target = bs[bs.length - 1];
+              target.scrollIntoView({block:'center'});
+              target.click();
+              target.dispatchEvent(new MouseEvent('click',
+                {bubbles:true, cancelable:true, view:window}));
+              return 'clicked';
+            })()
+            """)
+            if r == 'clicked':
+                submitted = True
+                reason = 'js_click'
+            elif r:
+                reason = str(r)
+        except Exception as e:
+            reason = str(e)[:60]
+
+    # 策略 3：表单直接提交
+    if not submitted:
+        try:
+            r = sb.driver.execute_script("""
+            (function(){
+              var f = document.getElementById('form-submit');
+              if (!f) return 'no_form';
+              if (typeof f.requestSubmit === 'function') {
+                f.requestSubmit(); return 'requestSubmit';
+              }
+              f.submit(); return 'form_submit';
+            })()
+            """)
+            if r in ('requestSubmit', 'form_submit'):
+                submitted = True
+                reason = r
+            elif r:
+                reason = str(r)
+        except Exception as e:
+            reason = str(e)[:60]
 
     if not submitted:
-        print("❌ 找不到提交按钮")
-        send_tg("❌", "找不到续期按钮", body[:300])
+        print(f"❌ 提交失败（{reason or '未知'}）")
+        _step(sb, "renew-submit-fail")
+        send_tg("❌", "续期提交失败", f"原因: {reason}\n{body[:200]}")
         return False, None
+
+    print(f"  ✅ 已提交（{reason}）")
 
     print("⏳ 等待结果…")
     time.sleep(8)
