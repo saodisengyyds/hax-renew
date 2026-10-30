@@ -1484,65 +1484,69 @@ def renew(sb):
     submitted = False
     reason = ""
 
-    # 优先找标有 "Renew VPS" 的提交按钮
+    # 直接使用原生 JS 强力穿透点击或提交表单（不受广告遮罩与 is_displayed 影响）
     try:
-        btns = sb.find_elements('button, input[type="submit"]')
-        for b in btns:
-            try:
-                t = (b.text or b.get_attribute("value") or "").strip().lower()
-                if "renew vps" in t or "renew" in t:
-                    if b.is_displayed():
-                        sb.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
-                        time.sleep(0.5)
-                        b.click()
-                        submitted = True
-                        reason = f"renew_button_click ({t})"
-                        print(f"  ✅ 点击续期提交按钮: {t}")
-                        break
-            except Exception:
-                pass
+        r = sb.driver.execute_script("""
+        (function(){
+            // 1. 尝试找带有 Renew VPS 的按钮
+            var bs = document.querySelectorAll('button[name="submit_button"], button.btn-primary, button');
+            for (var i = 0; i < bs.length; i++) {
+                var t = (bs[i].innerText || bs[i].textContent || bs[i].value || '').trim().toLowerCase();
+                if (t.indexOf('renew') !== -1) {
+                    bs[i].scrollIntoView({block:'center'});
+                    bs[i].click();
+                    bs[i].dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                    return 'clicked_renew_btn';
+                }
+            }
+            // 2. 尝试点击第一个未被注释的 submit_button
+            var subs = document.querySelectorAll('button[name="submit_button"]');
+            if (subs.length > 0) {
+                var target = subs[subs.length - 1];
+                target.scrollIntoView({block:'center'});
+                target.click();
+                target.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                return 'clicked_submit_name_btn';
+            }
+            // 3. 触发表单 requestSubmit 或 submit
+            var f = document.querySelector('form#form-submit') || document.querySelector('form.submit') || document.querySelector('form');
+            if (f) {
+                if (typeof f.requestSubmit === 'function') {
+                    f.requestSubmit();
+                    return 'form_requestSubmit';
+                }
+                f.submit();
+                return 'form_submit';
+            }
+            return 'none';
+        })()
+        """)
+        if r and r != 'none':
+            submitted = True
+            reason = str(r)
+            print(f"  ✅ JS 强力提交成功: {r}")
+        else:
+            print(f"  ⚠️ JS 提交返回: {r}")
     except Exception as e:
-        print(f"  ⚠️ 寻找提交按钮异常: {e}")
+        print(f"  ⚠️ JS 提交执行异常: {e}")
 
-    # 兜底点击 name=submit_button
+    # 原生 Selenium 备用点击
     if not submitted:
         try:
             btns = sb.find_elements('button[name="submit_button"]')
             for idx, b in enumerate(btns):
-                if b.is_displayed():
+                try:
                     sb.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
                     time.sleep(0.5)
                     b.click()
                     submitted = True
-                    reason = f"submit_button_{idx}"
-                    print(f"  ✅ 点击 submit_button #{idx}")
+                    reason = f"native_click_{idx}"
+                    print(f"  ✅ 原生点击按钮 #{idx}")
                     break
-        except Exception as e:
+                except Exception:
+                    pass
+        except Exception:
             pass
-
-    if not submitted:
-        print("  ⚠️  未直接找到按钮，尝试直接触发表单提交...")
-        try:
-            r = sb.driver.execute_script("""
-            (function(){
-                var f = document.querySelector('form#form-submit') || document.querySelector('form.submit') || document.querySelector('form');
-                if (f) {
-                    if (typeof f.requestSubmit === 'function') {
-                        f.requestSubmit();
-                        return 'requestSubmit';
-                    }
-                    f.submit();
-                    return 'submit';
-                }
-                return 'no_form';
-            })()
-            """)
-            if r in ('requestSubmit', 'submit'):
-                submitted = True
-                reason = f"form_{r}"
-                print(f"  ✅ 表单直接提交成功: {r}")
-        except Exception as e:
-            print(f"  ⚠️ 表单兜底提交异常: {e}")
 
     if not submitted:
         print("❌ 无法定位提交按钮")
