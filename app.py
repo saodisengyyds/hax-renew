@@ -292,6 +292,89 @@ def fetch_code(max_wait: int = 180, interval: int = 8):
     return None
 
 
+# ==================== Cookie 存取 ====================
+
+COOKIE_FILE = "hh_cookies.json"
+
+
+def load_cookies():
+    if not os.path.exists(COOKIE_FILE):
+        return []
+    try:
+        data = json.load(open(COOKIE_FILE, encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"⚠️  cookie 文件读取失败: {e}")
+        return []
+
+
+def save_cookies(sb):
+    """把当前浏览器的 cookie 存下来"""
+    try:
+        raw = sb.get_cookies()
+    except Exception as e:
+        print(f"⚠️  取 cookie 失败: {e}")
+        return False
+
+    host = SITE_HOST.lower()
+    out = []
+    for c in raw:
+        dom = (c.get("domain") or "").lower()
+        if host and host not in dom and dom not in ("", host):
+            continue
+        item = {
+            "name": c.get("name"),
+            "value": c.get("value", ""),
+            "domain": c.get("domain") or host,
+            "path": c.get("path") or "/",
+        }
+        if c.get("expiry"):
+            item["expires"] = int(c["expiry"])
+        out.append(item)
+
+    if not out:
+        print("⚠️  没有可保存的 cookie")
+        return False
+
+    try:
+        json.dump(out, open(COOKIE_FILE, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=2)
+        print(f"🍪 已保存 {len(out)} 个 cookie → {COOKIE_FILE}")
+        return True
+    except Exception as e:
+        print(f"⚠️  保存 cookie 失败: {e}")
+        return False
+
+
+def apply_cookies(sb, cookies) -> int:
+    """把 cookie 注入浏览器，返回成功数量"""
+    if not cookies:
+        return 0
+    ok = 0
+    for c in cookies:
+        try:
+            sb.add_cookie({
+                "name": c["name"],
+                "value": c.get("value", ""),
+                "domain": c.get("domain") or SITE_HOST,
+                "path": c.get("path") or "/",
+            })
+            ok += 1
+        except Exception:
+            pass
+    print(f"🍪 注入 {ok}/{len(cookies)} 个 cookie")
+    return ok
+
+
+def cookies_look_valid(cookies) -> bool:
+    """粗判：有没有会话类 cookie"""
+    if not cookies:
+        return False
+    names = " ".join((c.get("name") or "").lower() for c in cookies)
+    keys = ["session", "sess", "auth", "token", "login", "remember", "sid"]
+    return any(k in names for k in keys)
+
+
 # ==================== 页面工具 ====================
 
 def dump_page(sb, tag):
@@ -632,7 +715,15 @@ def _is_logged_in(sb):
 
 # ==================== 登录 ====================
 
-def login(sb):
+def login(sb, tg_wait: int = 240) -> bool:
+    """
+    登录流程：
+      1. 打开 /login
+      2. 填手机号 → 提交
+      3. 从邮箱取验证码 → 填入 → 提交
+      4. 页面可能要求 TG 确认 —— 推通知给你，等你点
+      5. 轮询等待登录完成，成功后保存 cookie
+    """
     print(f"\n🌐 打开登录页: {login_url()}")
     try:
         sb.uc_open_with_reconnect(login_url(), reconnect_time=6)
@@ -645,12 +736,11 @@ def login(sb):
 
     if _is_logged_in(sb):
         print("✅ 已有登录态")
+        save_cookies(sb)
         return True
 
-    # 广告墙没点掉时，这里会是空页面
     if not _has_login_form(sb):
-        print("⚠️  仍然没有登录表单，再尝试一次广告墙…")
-        dump_page(sb, "before-adwall-retry")
+        print("⚠️  没有登录表单，再打一轮广告墙…")
         _pass_ad_wall(sb, rounds=3)
 
     dump_page(sb, "login")
@@ -658,40 +748,28 @@ def login(sb):
     # ---- 填手机号 ----
     phone_sels = [
         'input[name="phone"]', 'input[id="phone"]',
-        'input[type="tel"]', 'input[name="username"]',
-        'input[id="text"]', 'input[type="text"]',
+        'input[type="tel"]', 'input[name="mobile"]',
+        'input[name="username"]', 'input[id="text"]',
+        'input[type="text"]', 'input[type="email"]',
     ]
     if not _fill(sb, phone_sels, PHONE, "手机号"):
         dump_page(sb, "no-phone-input")
         return False
     time.sleep(1)
 
-    # ---- 提交手机号 ----
+    # ---- 提交 ----
     print("🖱️  提交手机号…")
-    sb.execute_script("""
-    (function(){
-      var bs = document.querySelectorAll('button,input[type=submit]');
-      for (var i=0;i<bs.length;i++){
-        var t = (bs[i].innerText||bs[i].value||'').toLowerCase();
-        if (/send|code|next|continue|login|submit|验证码|发送|下一步|登录/.test(t)){
-          bs[i].click(); return true;
-        }
-      }
-      var f = document.querySelector('form');
-      if (f) { f.submit(); return true; }
-      return false;
-    })()
-    """)
+    _click_submit(sb)
     time.sleep(6)
     _wait_ready(sb, 20)
+    _pass_ad_wall(sb, rounds=2)
 
-    # ---- 拿验证码 ----
+    # ---- 验证码 ----
     token = fetch_code(max_wait=180, interval=8)
     if not token:
         send_tg("❌", "取不到验证码", "检查 IMAP 配置或邮件主题关键词")
         return False
 
-    # ---- 填验证码 ----
     code_sels = [
         'input[name="code"]', 'input[id="code"]',
         'input[name="token"]', 'input[id="token"]',
@@ -705,32 +783,94 @@ def login(sb):
     time.sleep(1)
 
     print("🖱️  提交验证码…")
-    sb.execute_script("""
-    (function(){
-      var bs = document.querySelectorAll('button,input[type=submit]');
-      for (var i=0;i<bs.length;i++){
-        var t = (bs[i].innerText||bs[i].value||'').toLowerCase();
-        if (/submit|verify|login|continue|确认|登录|验证/.test(t)){
-          bs[i].click(); return true;
-        }
-      }
-      var f = document.querySelector('form');
-      if (f) { f.submit(); return true; }
-      return false;
-    })()
-    """)
+    _click_submit(sb)
+    time.sleep(5)
 
-    print("⏳ 等待登录结果…")
-    for i in range(25):
-        time.sleep(1)
-        _pass_ad_wall(sb)
+    # ---- 等 TG 确认 ----
+    print("\n" + "=" * 50)
+    print("  可能需要手机 Telegram 确认")
+    print("=" * 50)
+    send_tg(
+        "📲",
+        "请在手机上确认登录",
+        f"hax 登录需要 Telegram 确认，请在 {tg_wait} 秒内点击确认",
+    )
+
+    print(f"⏳ 等待登录完成（最多 {tg_wait}s，期间请在手机上点 TG 确认）…")
+    deadline = time.time() + tg_wait
+    last_report = 0
+    while time.time() < deadline:
+        time.sleep(3)
+
         if _is_logged_in(sb):
-            print(f"✅ 登录成功（{i+1}s）")
+            print("✅ 登录成功！")
+            save_cookies(sb)
             return True
 
-    dump_page(sb, "login-failed")
-    print("❌ 登录失败")
-    send_tg("❌", "登录失败", "请查看 Actions 日志")
+        # 每 30 秒报一次进度
+        remain = int(deadline - time.time())
+        if remain // 30 != last_report:
+            last_report = remain // 30
+            cur = sb.get_current_url() or ""
+            print(f"   等待中… 剩余 {remain}s  URL={cur}")
+
+        # 顺便再打一次广告墙
+        try:
+            _pass_ad_wall(sb, rounds=1)
+        except Exception:
+            pass
+
+    # 超时
+    print("❌ 等待登录超时")
+    dump_page(sb, "login-timeout")
+    send_tg("⏰", "登录超时", "没有检测到登录成功，请检查是否需要手动确认")
+    return False
+
+
+def _click_submit(sb):
+    """点提交按钮：先按常见选择器，再按文本，最后按回车"""
+    try:
+        for sel in ['button[name="submit_button"]', 'button[type="submit"]',
+                    'input[type="submit"]']:
+            try:
+                btn = sb.find_element(sel, timeout=2)
+                if btn and btn.is_displayed():
+                    btn.click()
+                    print(f"  🖱️  {sel}")
+                    return True
+            except Exception:
+                continue
+
+        ok = sb.execute_script(r"""
+        (function(){
+          var bs=document.querySelectorAll('button,input[type=submit],a.btn');
+          for(var i=0;i<bs.length;i++){
+            var t=(bs[i].innerText||bs[i].value||'').toLowerCase();
+            if(/send|submit|verify|login|continue|next|confirm|验证码|发送|下一步|登录|确认/.test(t)){
+              bs[i].click(); return true;
+            }
+          }
+          return false;})()
+        """)
+        if ok:
+            print("  🖱️  按文本点击")
+            return True
+    except Exception:
+        pass
+
+    # 回车兜底
+    try:
+        for sel in ['input[type="text"]', 'input[type="tel"]', 'input[type="password"]']:
+            try:
+                el = sb.find_element(sel, timeout=1)
+                if el and el.is_displayed():
+                    el.send_keys("\n")
+                    print("  ⌨️  回车提交")
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
     return False
 
 
@@ -952,6 +1092,10 @@ def main():
     ok = False
     new_expiry = None
 
+    # 先读上次保存的 cookie
+    cookies = load_cookies()
+    print(f"🍪 本地 cookie: {len(cookies)} 个")
+
     with SB(**kw) as sb:
         try:
             sb.open("https://api.ip.sb/ip")
@@ -960,9 +1104,44 @@ def main():
             pass
 
         try:
-            if not login(sb):
-                sys.exit(5)
-            ok, new_expiry = renew(sb)
+            # ---------- 1) 尝试用 cookie 直接续期 ----------
+            used_cookie = False
+            if cookies:
+                print("\n🔑 尝试用已保存的 cookie 续期…")
+                try:
+                    sb.open(SITE)
+                    time.sleep(2)
+                except Exception:
+                    pass
+
+                injected = apply_cookies(sb, cookies)
+                if injected:
+                    # 直接开续期页看是否登录
+                    try:
+                        sb.uc_open_with_reconnect(renew_url(), reconnect_time=5)
+                    except Exception:
+                        sb.open(renew_url())
+                    time.sleep(5)
+                    _wait_ready(sb, 30)
+
+                    if _is_logged_in(sb):
+                        print("✅ cookie 有效，跳过登录")
+                        used_cookie = True
+                        ok, new_expiry = renew(sb)
+                    else:
+                        print("⚠️  cookie 已失效，需要重新登录")
+                        try:
+                            os.remove(COOKIE_FILE)
+                            print("   已删除失效的 cookie 文件")
+                        except Exception:
+                            pass
+
+            # ---------- 2) cookie 不可用 → 登录 ----------
+            if not used_cookie:
+                if not login(sb):
+                    sys.exit(5)
+                ok, new_expiry = renew(sb)
+
         except Exception as e:
             print(f"❌ 异常: {e}")
             import traceback

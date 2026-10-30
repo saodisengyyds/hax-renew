@@ -15,7 +15,7 @@ on:
 jobs:
   Renew-HH:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     permissions:
       actions: write
       contents: write
@@ -50,6 +50,17 @@ jobs:
             echo "未配置 NODE_LINK，直连"
           fi
 
+      - name: 🍪 恢复 cookie
+        env:
+          HH_COOKIES: ${{ secrets.HH_COOKIES }}
+        run: |
+          if [ -n "$HH_COOKIES" ]; then
+            printf '%s' "$HH_COOKIES" > hh_cookies.json
+            echo "已从 Secret 恢复 cookie（$(wc -c < hh_cookies.json) bytes）"
+          else
+            echo "无 cookie Secret，本次将走登录流程"
+          fi
+
       - name: 🚀 运行续期
         env:
           HH_SITE:            ${{ secrets.HH_SITE }}
@@ -73,7 +84,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 1) 到期日有变化就暂存
+          # 1) 到期日 / cookie 有变化就暂存
           if [ -f hh_state.json ]; then
             git add hh_state.json
           fi
@@ -98,6 +109,15 @@ jobs:
             git push || true
             echo "✅ 已提交"
           fi
+
+      - name: 🍪 上传新 cookie
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cookies
+          path: hh_cookies.json
+          retention-days: 1
+          if-no-files-found: ignore
 
       - name: 📸 上传失败截图
         if: failure()
