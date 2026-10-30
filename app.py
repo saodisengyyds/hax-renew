@@ -131,6 +131,22 @@ def parse_expiry(text: str):
     if not text:
         return None
 
+    # 优先匹配英文月份格式：November 4, 2026 或 04 Nov 2026
+    months = {
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+        'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
+        'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12
+    }
+    m_en = re.search(r'([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})', text)
+    if m_en:
+        mon_str, day_str, year_str = m_en.group(1).lower(), m_en.group(2), m_en.group(3)
+        if mon_str in months:
+            try:
+                return datetime(int(year_str), months[mon_str], int(day_str)).date()
+            except Exception:
+                pass
+
     pats = [
         r"(?:expir\w*|renew\w*|到期|过期)[^\d]{0,30}(\d{4})[-/](\d{1,2})[-/](\d{1,2})",
         r"(?:expir\w*|renew\w*|到期|过期)[^\d]{0,30}(\d{1,2})[-/](\d{1,2})[-/](\d{4})",
@@ -1307,183 +1323,192 @@ def renew(sb):
     body = sb.get_text("body") or ""
     low = body.lower()
 
+    # 1. 检查是否已经是续期成功页面（比如刚手动续完）
+    if "your vps has been renewed until" in low:
+        print("🎉 页面显示已成功续期！")
+        d = parse_expiry(body)
+        send_tg("✅", f"VPS 当前已续期\n📅 到期日: {d}", body[:300])
+        return True, d
+
     if re.search(r"can'?t renew|cannot renew|not (yet )?time|无法续期|未到|too early", low):
         print("⏳ 还没到续期时间")
         d = parse_expiry(body)
         send_tg("⏳", "未到续期时间", body[:300])
         return True, d
 
-    # 表单存在性检查用原生（该页 execute_script 常返回 None）
-    has_form = False
+    # 2. 检查是否有「INPUT RENEW CODE」展开按钮（第一步交互）
+    print("🔍 检查 INPUT RENEW CODE 展开按钮…")
+    expanded = False
     try:
-        el = sb.find_element('input[name="web_address"]', timeout=5)
-        has_form = bool(el and el.is_displayed())
-    except Exception:
-        try:
-            el = sb.find_element('#web_address', timeout=3)
-            has_form = bool(el and el.is_displayed())
-        except Exception:
-            has_form = False
-
-    if not has_form:
-        print("❌ 找不到续期表单")
-        _step(sb, "renew-no-form")
-        send_tg("❌", "找不到续期表单", body[:300])
-        return False, None
-    print("  ✅ 续期表单已就位")
-
-    # 网站地址
-    print("✏️  填网站地址…")
-    # 原生输入：这个页面 JS 执行不稳定（execute_script 常返回 None）
-    filled_addr = False
-    for sel in ['input[name="web_address"]', '#web_address']:
-        try:
-            el = sb.find_element(sel, timeout=3)
-            if el and el.is_displayed():
-                el.clear()
-                el.click()
-                el.send_keys(SITE_HOST)
-                filled_addr = True
-                print(f"  ✅ 已填 {SITE_HOST}（{sel}）")
+        # 寻找包含 INPUT RENEW CODE 的按钮或链接
+        btn_expand = None
+        for sel in ["button", "a", "div"]:
+            elems = sb.find_elements(sel)
+            for el in elems:
+                try:
+                    txt = (el.text or "").strip().upper()
+                    if "INPUT RENEW CODE" in txt or "RENEW CODE" in txt:
+                        btn_expand = el
+                        break
+                except Exception:
+                    pass
+            if btn_expand:
                 break
-        except Exception:
-            continue
-    if not filled_addr:
-        print("  ⚠️  没填上网站地址，尝试 JS 兜底")
+
+        if btn_expand:
+            print("  🖱️ 点击「INPUT RENEW CODE」按钮展开输入表单…")
+            try:
+                sb.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn_expand)
+                time.sleep(0.5)
+                btn_expand.click()
+            except Exception:
+                try:
+                    sb.driver.execute_script("arguments[0].click();", btn_expand)
+                except Exception:
+                    pass
+            time.sleep(2)
+            expanded = True
+    except Exception as e:
+        print(f"  ⚠️ 查找/点击展开按钮异常: {e}")
+
+    # 3. 检查是否有 Verification Code 输入框
+    print("🔍 查找续期验证码输入框 (Verification Code)…")
+    code_input = None
+    for sel in ['input[name*="code"]', 'input[id*="code"]', 'input[placeholder*="code" i]',
+                'input[name*="otp"]', 'input[id*="otp"]', 'input[name*="token"]',
+                'textarea[name*="code"]', 'input.form-control']:
         try:
-            sb.driver.execute_script(
-                "var e=document.querySelector('#web_address');if(e)e.value='%s';" % SITE_HOST)
+            elems = sb.find_elements(sel)
+            for el in elems:
+                try:
+                    if el.is_displayed():
+                        # 排除掉地址输入框
+                        name_attr = (el.get_attribute("name") or "").lower()
+                        id_attr = (el.get_attribute("id") or "").lower()
+                        if "address" in name_attr or "address" in id_attr:
+                            continue
+                        code_input = el
+                        print(f"  ✅ 定位到验证码输入框: {sel} (name={name_attr}, id={id_attr})")
+                        break
+                except Exception:
+                    pass
+            if code_input:
+                break
         except Exception:
             pass
-    time.sleep(1)
 
-    # 协议
-    print("☑️  勾协议…")
-    checked = False
-    try:
-        ag = sb.find_element('input[name="agreement"]', timeout=3)
-        if ag:
-            if not ag.is_selected():
-                try:
-                    ag.click()
-                except Exception:
-                    # 被遮挡时点它的 label
+    # 4. 如果找到了验证码输入框，从邮箱获取验证码并填入
+    if code_input:
+        print("🔐 需要填入续期验证码，启动邮箱轮询…")
+        token = fetch_code(max_wait=180, interval=8)
+        if not token:
+            print("❌ 未能从邮箱获取到验证码")
+            send_tg("❌", "未能从邮箱获取到验证码", body[:300])
+            return False, None
+
+        print(f"✍️ 填入验证码 ({len(token)} 字符)…")
+        try:
+            code_input.clear()
+            code_input.click()
+            code_input.send_keys(token)
+            time.sleep(1)
+        except Exception as e:
+            print(f"  ⚠️ 输入验证码异常: {e}")
+            try:
+                sb.driver.execute_script("arguments[0].value = arguments[1];", code_input, token)
+            except Exception:
+                pass
+
+        # 5. 检查并处理算术计算题（Math Captcha，如 a + b = ?）
+        print("🧮 检查算术验证码…")
+        try:
+            # 抓取页面文本中的算术题
+            body_now = sb.get_text("body") or ""
+            # 匹配算术表达式，如 "5 + 3 =" 或 "12 - 4 ="
+            math_match = re.search(r'(\d+)\s*([\+\-\×\*\÷\/])\s*(\d+)\s*=', body_now)
+            if math_match:
+                n1, op, n2 = int(math_match.group(1)), math_match.group(2), int(math_match.group(3))
+                ans = n1 + n2 if op == '+' else (n1 - n2 if op == '-' else n1 * n2)
+                print(f"  💡 识别到算术题: {n1} {op} {n2} = {ans}")
+                # 寻找答案输入框
+                for m_sel in ['input[name*="captcha"]', 'input[id*="captcha"]', 'input[name*="result"]', 'input[name*="math"]']:
                     try:
-                        sb.find_element('label.form-check-label', timeout=2).click()
+                        m_el = sb.find_element(m_sel, timeout=2)
+                        if m_el and m_el.is_displayed():
+                            m_el.clear()
+                            m_el.send_keys(str(ans))
+                            print(f"  ✅ 已填入算术答案: {ans}")
+                            break
                     except Exception:
                         pass
-            checked = ag.is_selected()
-            print(f"  {'✅' if checked else '⚠️'} 协议勾选状态: {checked}")
-    except Exception as e:
-        print(f"  ⚠️  勾协议异常: {str(e)[:60]}")
-    time.sleep(0.5)
+        except Exception as e:
+            print(f"  ⚠️ 算术题处理异常: {e}")
 
-    # 验证码（如果页面要求）—— 原生查找
-    need_code = None
-    for sel in ['input[name*="code"]', 'input[id*="code"]',
-                'input[name*="otp"]', 'input[id*="otp"]',
-                'input[name*="verify"]', 'input[id*="verify"]']:
-        try:
-            el = sb.find_element(sel, timeout=1)
-            if el and el.is_displayed():
-                need_code = sel
-                break
-        except Exception:
-            continue
-
-    if need_code:
-        print(f"🔐 需要验证码: {need_code}")
-        token = fetch_code(max_wait=180, interval=8)
-        if token:
-            _fill(sb, [need_code], token, "验证码")
-            time.sleep(1)
-
-    # 提交
-    print("🖱️  提交续期…")
-    submitted = False
-    reason = ""
-
-    # 这个页面 execute_script 经常返回 None，全部改用原生 Selenium 操作
-
-    # 1) 等 Turnstile token（原生读 value 属性）
-    print("  ⏳ 等 Turnstile token…")
-    token_ok = False
-    for i in range(20):
+    # 6. 等待 Turnstile 人机验证
+    print("⏳ 等 Turnstile token…")
+    for _ in range(20):
         try:
             el = sb.find_element('input[name="cf-turnstile-response"]', timeout=2)
             v = el.get_attribute("value") or ""
             if len(v) > 20:
                 print(f"  ✅ Turnstile 就绪（{len(v)} 字符）")
-                token_ok = True
                 break
         except Exception:
             pass
         time.sleep(1)
-    if not token_ok:
-        print("  ⚠️  Turnstile token 未就绪，仍尝试提交")
 
-    # 2) 找提交按钮（两个同名、无文本）
-    btns = []
+    # 7. 提交续期按钮
+    print("🖱️  提交续期…")
+    submitted = False
+    reason = ""
+
+    # 优先找标有 "Renew VPS" 的提交按钮
     try:
-        btns = sb.find_elements('button[name="submit_button"]')
-    except Exception:
-        pass
-    print(f"  找到 {len(btns)} 个 submit_button")
-
-    # 3) 依次尝试点击
-    for idx, b in enumerate(btns):
-        try:
-            if not b.is_displayed():
-                continue
-            # 滚到可视区
+        btns = sb.find_elements('button, input[type="submit"]')
+        for b in btns:
             try:
-                sb.driver.execute_script(
-                    "arguments[0].scrollIntoView({block:'center'});", b)
+                t = (b.text or b.get_attribute("value") or "").strip().lower()
+                if "renew vps" in t or "renew" in t:
+                    if b.is_displayed():
+                        sb.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
+                        time.sleep(0.5)
+                        b.click()
+                        submitted = True
+                        reason = f"renew_button_click ({t})"
+                        print(f"  ✅ 点击续期提交按钮: {t}")
+                        break
             except Exception:
                 pass
-            time.sleep(0.5)
-            try:
-                b.click()
-            except Exception:
-                # 被遮挡时用 ActionChains 坐标点
-                try:
-                    from selenium.webdriver.common.action_chains import ActionChains
-                    ActionChains(sb.driver).move_to_element(b).click().perform()
-                except Exception:
-                    continue
-            submitted = True
-            reason = f"native_click[{idx}]"
-            print(f"  ✅ 点击按钮 #{idx}")
-            break
-        except Exception as e:
-            print(f"  ⚠️  按钮 #{idx} 点击失败: {str(e)[:60]}")
+    except Exception as e:
+        print(f"  ⚠️ 寻找提交按钮异常: {e}")
 
-    # 4) 兜底：提交表单
+    # 兜底点击 name=submit_button
     if not submitted:
         try:
-            f = sb.find_element('form#form-submit', timeout=3)
-            if f:
-                f.submit()
-                submitted = True
-                reason = "form_submit"
-                print("  ✅ 直接提交表单")
+            btns = sb.find_elements('button[name="submit_button"]')
+            for idx, b in enumerate(btns):
+                if b.is_displayed():
+                    sb.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
+                    time.sleep(0.5)
+                    b.click()
+                    submitted = True
+                    reason = f"submit_button_{idx}"
+                    print(f"  ✅ 点击 submit_button #{idx}")
+                    break
         except Exception as e:
-            print(f"  ⚠️  表单提交失败: {str(e)[:60]}")
+            pass
 
     if not submitted:
-        print(f"❌ 提交失败（{reason or '所有方式都失败'}）")
-        _step(sb, "renew-submit-fail")
-        send_tg("❌", "续期提交失败", f"原因: {reason}\n{body[:200]}")
+        print("❌ 无法定位提交按钮")
+        _step(sb, "renew-no-submit-btn")
         return False, None
 
     print(f"  ✅ 已提交（{reason}）")
-
-    print("⏳ 等待结果…")
-    time.sleep(8)
+    print("⏳ 等待结果（10s）…")
+    time.sleep(10)
     _pass_ad_wall(sb)
 
     return _check_result(sb)
-
 
 def _check_result(sb):
     print("\n📋 检查结果…")
@@ -1500,7 +1525,8 @@ def _check_result(sb):
     low = body.lower()
     expiry = parse_expiry(body)
 
-    if re.search(r"renewed|success|extended|已续期|成功|延长", low):
+    # 准确判定：必须出现明确的成功语句（例如 Your VPS has been renewed until...）
+    if "has been renewed" in low or "renewed until" in low or "successfully renewed" in low or "续期成功" in low:
         msg = "续期成功"
         if expiry:
             msg += f"\n📅 新到期日: {expiry}"
