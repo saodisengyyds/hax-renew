@@ -1113,28 +1113,119 @@ def _login_by_telegram(sb, tg_wait: int) -> bool:
         return False
 
     # ---- 直接打开 Telegram 官方授权页（跳过 iframe，防止浏览器崩溃） ----
-    print("🌐 直接导航至 Telegram 授权页…")
-    auth_url = ""
+    # ---- 在 iframe 内部点击（widget 必须嵌在父页面里才能工作）----
+    # 实测：单独打开 embed 页，点按钮无反应（它要 postMessage 给父页面）
+    print("🖱️  进入 iframe 点击登录按钮…")
+
+    frame_idx = -1
     try:
-        src = tg_frame.get_attribute("src") or ""
-        # src 形如: https://oauth.telegram.org/embed/LoginHaxBot?origin=https%3A%2F%2Fhax.co.id&return_to=...
-        if "/embed/" in src:
-            auth_url = src.replace("/embed/", "/auth?bot_id=")
-            # 修正参数名
-            auth_url = auth_url.replace("?bot_id=", "?bot_id=").replace("&size=medium", "")
-        else:
-            auth_url = f"https://oauth.telegram.org/auth?bot_id=LoginHaxBot&origin={SITE}&return_to={SITE}/login"
+        for i, ifr in enumerate(sb.find_elements("iframe")):
+            try:
+                s0 = ifr.get_attribute("src") or ""
+                fid = ifr.get_attribute("id") or ""
+                if "oauth.telegram.org" in s0 or "telegram-login" in fid:
+                    frame_idx = i
+                    break
+            except Exception:
+                continue
     except Exception:
-        auth_url = f"https://oauth.telegram.org/auth?bot_id=LoginHaxBot&origin={SITE}&return_to={SITE}/login"
+        pass
 
-    print(f"  🔗 目标 URL: {auth_url}")
+    clicked = False
+    if frame_idx >= 0:
+        print(f"  📍 widget 在第 {frame_idx} 个 iframe")
+        try:
+            # 用索引切换：传元素会被 SeleniumBase 做 JSON 序列化而报错
+            sb.driver.switch_to.frame(frame_idx)
+            time.sleep(2)
+
+            for sel in ["button", "a", "div[role='button']",
+                        ".tgme_widget_login_button", ".tgme_widget_login_button_wrap"]:
+                try:
+                    for b in sb.find_elements("css selector", sel):
+                        try:
+                            if not b.is_displayed():
+                                continue
+                            txt = (b.text or "").strip()
+                            b.click()
+                            clicked = True
+                            print(f"  ✅ 点击 iframe 内「{txt[:30]}」")
+                            break
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+                if clicked:
+                    break
+
+            if not clicked:
+                # JS 兜底
+                clicked = bool(sb.driver.execute_script(r"""
+                (function(){
+                  var b=document.querySelector('.tgme_widget_login_button, button, a');
+                  if(b){ b.click(); return true; }
+                  return false;})()
+                """))
+                if clicked:
+                    print("  ✅ JS 点击 iframe 内按钮")
+        except Exception as e:
+            print(f"  ⚠️  iframe 内点击失败: {str(e)[:90]}")
+        finally:
+            try:
+                sb.driver.switch_to.default_content()
+            except Exception:
+                pass
+    else:
+        print("  ⚠️  没定位到 widget iframe")
+
+    if not clicked:
+        print("❌ 无法点击 Telegram 登录按钮")
+        send_tg("❌", "点击 Telegram 登录失败", "iframe 内找不到按钮")
+        return False
+
+    time.sleep(6)
+
+    if not _driver_alive(sb):
+        print("❌ 点击后浏览器崩溃")
+        send_tg("❌", "浏览器崩溃", "点击 Telegram 按钮后 Chrome 退出")
+        return False
+
+    # ---- 检测是否弹了新窗口 ----
+    new_handle = None
     try:
-        sb.open(auth_url)
+        for _ in range(12):
+            now_handles = set(sb.driver.window_handles)
+            added = now_handles - before_handles
+            if added:
+                new_handle = list(added)[0]
+                print(f"🔀 新窗口已弹出（共 {len(now_handles)} 个）")
+                sb.driver.switch_to.window(new_handle)
+                time.sleep(3)
+                print(f"   URL: {(sb.get_current_url() or '')[:90]}")
+                break
+            # 也可能同窗口内切换
+            for h in now_handles:
+                try:
+                    sb.driver.switch_to.window(h)
+                    u = sb.get_current_url() or ""
+                    if "oauth.telegram.org" in u and "/embed/" not in u:
+                        new_handle = h
+                        print(f"🔀 匹配到授权窗口: {u[:90]}")
+                        break
+                except Exception:
+                    continue
+            if new_handle:
+                break
+            time.sleep(1)
     except Exception as e:
-        print(f"⚠️  打开授权页异常: {e}")
+        print(f"  ⚠️  窗口检测失败: {str(e)[:80]}")
+        if not _driver_alive(sb):
+            print("❌ 浏览器已崩溃")
+            send_tg("❌", "浏览器崩溃", "检测窗口时 Chrome 退出")
+            return False
 
-    time.sleep(3)
-    _step(sb, "tg-oauth-page")
+    if not new_handle:
+        print("⚠️  没弹出新窗口，在当前页继续找表单")
 
     # ---- 找手机号输入 ----
     print("🔎 查找手机号输入框…")
