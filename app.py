@@ -573,6 +573,36 @@ def _count_inputs(sb) -> int:
         return -1
 
 
+def _click_el(sb, el) -> bool:
+    """安全点击 WebElement（避免 SeleniumBase 的 JSON 序列化问题）"""
+    # 1) 原生 click
+    try:
+        el.click()
+        return True
+    except Exception:
+        pass
+    # 2) 用 driver 的 JS 点击（原生 WebElement，不经过 SeleniumBase 包装）
+    try:
+        sb.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", el)
+        sb.driver.execute_script("arguments[0].click();", el)
+        return True
+    except Exception:
+        pass
+    # 3) 坐标点击
+    try:
+        loc = el.location
+        size = el.size
+        x = int(loc["x"] + size["width"] / 2)
+        y = int(loc["y"] + size["height"] / 2)
+        sb.driver.execute_script(f"window.scrollTo(0, {max(0, y - 300)});")
+        from selenium.webdriver.common.action_chains import ActionChains
+        ActionChains(sb.driver).move_by_offset(x, y).click().perform()
+        return True
+    except Exception:
+        return False
+
+
 def _pass_ad_wall(sb, rounds: int = 3) -> bool:
     """
     广告墙是 Google Funding Choices（fc-dialog 结构）：
@@ -608,16 +638,9 @@ def _pass_ad_wall(sb, rounds: int = 3) -> bool:
                 "css selector",
                 ".fc-cta-button.fc-cta-close, button[aria-label='Dismiss'], .fc-dialog-overlay .fc-cta-close")
             if closes:
-                btn = closes[0]
-                sb.driver.execute_script(
-                    "arguments[0].scrollIntoView({block:'center'});", btn)
-                time.sleep(0.4)
-                try:
-                    btn.click()
-                except Exception:
-                    sb.driver.execute_script("arguments[0].click();", btn)
-                clicked = True
-                print("  🖱️  点击 Dismiss")
+                if _click_el(sb, closes[0]):
+                    clicked = True
+                    print("  🖱️  点击 Dismiss")
         except Exception as e:
             print(f"  ⚠️  Dismiss 失败: {str(e)[:70]}")
 
@@ -625,15 +648,7 @@ def _pass_ad_wall(sb, rounds: int = 3) -> bool:
         if not clicked:
             try:
                 btns = sb.find_elements("css selector", ".fc-rewarded-ad-button")
-                if btns:
-                    btn = btns[0]
-                    sb.driver.execute_script(
-                        "arguments[0].scrollIntoView({block:'center'});", btn)
-                    time.sleep(0.4)
-                    try:
-                        btn.click()
-                    except Exception:
-                        sb.driver.execute_script("arguments[0].click();", btn)
+                if _click_el(sb, btns[0]):
                     clicked = True
                     print("  🖱️  点击 View a short ad")
             except Exception as e:
@@ -1057,10 +1072,24 @@ def _login_by_phone(sb, tg_wait: int) -> bool:
 
 
 def _login_by_telegram(sb, tg_wait: int) -> bool:
-    """Telegram OAuth Widget 登录"""
+    """
+    Telegram OAuth Widget 登录。
+
+    实际流程（用户确认）：
+      1. 点 widget → 弹出小窗口
+      2. 窗口里要求输入手机号
+      3. 填手机号 → Telegram 发确认到你手机
+      4. 手机点确认 → 回跳 → 登录完成
+    """
     print("\n📲 Telegram Widget 登录流程")
 
-    # ---- 找 Telegram 登录 widget ----
+    before_handles = set()
+    try:
+        before_handles = set(sb.driver.window_handles)
+    except Exception:
+        pass
+
+    # ---- 找 widget ----
     print("🔎 查找 Telegram 登录按钮…")
     tg_frame = None
     try:
@@ -1070,123 +1099,120 @@ def _login_by_telegram(sb, tg_wait: int) -> bool:
                 fid = ifr.get_attribute("id") or ""
                 if "oauth.telegram.org" in src or "telegram-login" in fid:
                     tg_frame = ifr
-                    print(f"  ✅ 找到 widget: id={fid}")
-                    print(f"     src={src[:120]}")
+                    print(f"  ✅ widget: id={fid}")
                     break
             except Exception:
                 continue
     except Exception as e:
-        print(f"  ⚠️  查找 iframe 失败: {e}")
+        print(f"  ⚠️  {e}")
 
     if not tg_frame:
-        print("❌ 没有找到 Telegram 登录 widget")
+        print("❌ 没找到 Telegram widget")
         dump_page(sb, "no-tg-widget")
-        send_tg("❌", "找不到 Telegram 登录按钮",
-                "页面结构可能变了，请查看 artifact 里的 HTML")
+        send_tg("❌", "找不到 Telegram 登录按钮", "页面结构可能变了")
         return False
 
-    # ---- 点它 ----
+    # ---- 点击 ----
     print("🖱️  点击 Telegram 登录…")
-    clicked = False
-    try:
-        tg_frame.click()
-        clicked = True
-    except Exception as e:
-        print(f"  ⚠️  直接点击失败: {str(e)[:80]}")
-
-    if not clicked:
-        # 用坐标点
-        try:
-            loc = tg_frame.location
-            size = tg_frame.size
-            x = loc["x"] + size["width"] / 2
-            y = loc["y"] + size["height"] / 2
-            sb.driver.execute_script(
-                f"window.scrollTo(0, {max(0, y - 300)});")
-            time.sleep(0.5)
-            print(f"  🖱️  坐标点击 ({x:.0f}, {y:.0f})")
-            from selenium.webdriver.common.action_chains import ActionChains
-            ActionChains(sb.driver).move_by_offset(x, y).click().perform()
-            clicked = True
-        except Exception as e:
-            print(f"  ⚠️  坐标点击失败: {str(e)[:80]}")
-
-    if not clicked:
-        print("❌ 点不动 Telegram 按钮")
+    if not _click_el(sb, tg_frame):
+        print("❌ 点不动 widget")
         return False
 
     time.sleep(5)
 
-    # ---- 通知你 ----
+    # ---- 检测是否开了新窗口 ----
+    new_handle = None
+    try:
+        now_handles = set(sb.driver.window_handles)
+        added = now_handles - before_handles
+        if added:
+            new_handle = list(added)[0]
+            print(f"🔀 检测到新窗口（共 {len(now_handles)} 个）")
+            sb.driver.switch_to.window(new_handle)
+            time.sleep(3)
+            print(f"   新窗口 URL: {sb.get_current_url()}")
+    except Exception as e:
+        print(f"  ⚠️  窗口检测失败: {e}")
+
+    # ---- 在新窗口（或当前页）找手机号输入 ----
+    print("🔎 查找手机号输入框…")
+    phone_filled = False
+    for attempt in range(12):
+        n = _count_inputs(sb)
+        if n > 0:
+            print(f"  ✅ 找到 {n} 个输入框（{attempt+1} 次尝试）")
+            _step(sb, "tg-popup-form")
+            break
+        time.sleep(2)
+
+    phone_sels = [
+        'input[name="phone"]', 'input[id="phone"]',
+        'input[type="tel"]', 'input[name="phone_number"]',
+        'input[placeholder*="phone"]', 'input[placeholder*="Phone"]',
+        'input[type="text"]',
+    ]
+    if _fill(sb, phone_sels, PHONE, "手机号"):
+        phone_filled = True
+        time.sleep(1)
+        print("🖱️  提交手机号…")
+        _click_submit(sb)
+        time.sleep(5)
+        _step(sb, "tg-phone-submitted")
+    else:
+        print("⚠️  没找到手机号输入框")
+        _step(sb, "tg-no-phone-input")
+        dump_page(sb, "tg-no-phone-input")
+
+    # ---- 通知 + 等确认 ----
     print("\n" + "=" * 52)
-    print("   需要你在手机上确认 Telegram 登录")
+    print("   请在手机上确认 Telegram 登录")
     print("=" * 52)
     send_tg(
         "📲",
         "请在手机上确认登录",
-        f"已点击 Telegram 登录按钮，请在 {tg_wait} 秒内\n"
-        f"打开 Telegram 点击确认授权",
+        f"已提交手机号，请在 {tg_wait} 秒内\n打开 Telegram 点击确认",
     )
 
-    # ---- 等回跳 ----
-    print(f"⏳ 等待授权完成（最多 {tg_wait}s）…")
+    print(f"⏳ 等待确认（最多 {tg_wait}s）…")
     deadline = time.time() + tg_wait
     last_report = 0
 
     while time.time() < deadline:
         time.sleep(3)
 
-        # 可能在多个窗口之间切换
+        # 在所有窗口里找 hax 的登录态
         try:
-            handles = sb.driver.window_handles
-            if len(handles) > 1:
-                cur = sb.driver.current_window_handle
-                # 切到新窗口看看
-                for h in handles:
-                    if h != cur:
+            for h in sb.driver.window_handles:
+                sb.driver.switch_to.window(h)
+                if _is_logged_in(sb):
+                    print("✅ 登录成功！")
+                    save_cookies(sb)
+                    # 关掉多余窗口
+                    try:
+                        for hh in sb.driver.window_handles:
+                            if hh != h:
+                                sb.driver.switch_to.window(hh)
+                                sb.driver.close()
                         sb.driver.switch_to.window(h)
-                        break
+                    except Exception:
+                        pass
+                    return True
         except Exception:
             pass
-
-        cur_url = ""
-        try:
-            cur_url = sb.get_current_url() or ""
-        except Exception:
-            pass
-
-        if "hax.co.id" in cur_url and "/login" not in cur_url:
-            print(f"✅ 已回跳: {cur_url}")
-            # 切回 hax 窗口
-            try:
-                handles = sb.driver.window_handles
-                for h in handles:
-                    sb.driver.switch_to.window(h)
-                    if "hax.co.id" in (sb.get_current_url() or ""):
-                        break
-            except Exception:
-                pass
-            time.sleep(2)
-            if _is_logged_in(sb):
-                print("✅ 登录成功！")
-                save_cookies(sb)
-                return True
-
-        # 直接判断登录态（同窗口回跳的情况）
-        if _is_logged_in(sb):
-            print("✅ 登录成功！")
-            save_cookies(sb)
-            return True
 
         remain = int(deadline - time.time())
         if remain // 30 != last_report:
             last_report = remain // 30
-            print(f"   等待中… 剩余 {remain}s  URL={cur_url[:70]}")
+            cur = ""
+            try:
+                cur = sb.get_current_url() or ""
+            except Exception:
+                pass
+            print(f"   等待中… 剩余 {remain}s  URL={cur[:70]}")
 
-    print("❌ 等待授权超时")
-    dump_page(sb, "tg-timeout")
-    send_tg("⏰", "登录超时",
-            f"没有检测到授权完成。如果手机上没收到确认，请重新运行")
+    print("❌ 等待确认超时")
+    _step(sb, "tg-timeout")
+    send_tg("⏰", "登录超时", "没检测到确认完成")
     return False
 
 
