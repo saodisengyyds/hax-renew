@@ -301,43 +301,71 @@ def dump_page(sb, tag):
     try:
         print(f"URL   : {sb.get_current_url()}")
         print(f"TITLE : {sb.get_title()}")
-        info = sb.execute_script("""
+        info = sb.execute_script(r"""
         (function(){
           function d(el){return {tag:el.tagName.toLowerCase(),id:el.id||'',
             name:el.getAttribute('name')||'',type:el.getAttribute('type')||'',
             ph:el.getAttribute('placeholder')||'',
             text:(el.innerText||el.value||'').trim().slice(0,40)};}
-          var o={inputs:[],buttons:[],forms:0};
+          var o={inputs:[],buttons:[],links:[],forms:0,bodyLen:0,bodyText:''};
           document.querySelectorAll('input,textarea,select').forEach(function(e){
             if(o.inputs.length<25)o.inputs.push(d(e));});
-          document.querySelectorAll('button,input[type=submit],a.btn').forEach(function(e){
+          document.querySelectorAll('button,input[type=submit],a').forEach(function(e){
             if(o.buttons.length<25)o.buttons.push(d(e));});
+          document.querySelectorAll('a[href]').forEach(function(e){
+            if(o.links.length<20)o.links.push({t:(e.innerText||'').trim().slice(0,30),h:e.getAttribute('href')});});
           o.forms=document.querySelectorAll('form').length;
+          var b=document.body;
+          o.bodyLen=b?(b.innerText||'').length:0;
+          o.bodyText=b?(b.innerText||'').replace(/[\s\u00a0]+/g,' ').slice(0,800):'';
           return o;})()
         """)
-        print("FORMS :", info.get("forms"))
+
+        if not isinstance(info, dict):
+            print("  ⚠️  execute_script 返回", type(info).__name__, "，改用 Selenium 取值")
+            try:
+                print("  BODY  :", (sb.get_text("body") or "").replace("\n", " | ")[:1200])
+                print("  SOURCE:", (sb.get_page_source() or "")[:2000])
+            except Exception as e2:
+                print("  取值也失败:", e2)
+            print("===== END =====\n")
+            return
+
+        # 兜底：即使 info 拿到了，正文太短也打印源码
+        if info.get("bodyLen", 0) < 60:
+            print("  ⚠️  正文过短，打印源码片段：")
+            try:
+                print("  SOURCE:", (sb.get_page_source() or "")[:2000])
+            except Exception:
+                pass
+
+        print("FORMS :", info.get("forms"), "| bodyLen:", info.get("bodyLen"))
         for i in info.get("inputs", []):
             print("  IN ", i)
         for b in info.get("buttons", []):
             print("  BTN", b)
-        print("TEXT  :", (sb.get_text("body") or "").replace("\n", " | ")[:700])
+        for l in info.get("links", []):
+            print("  A  ", l)
+        print("TEXT  :", info.get("bodyText", "")[:700])
     except Exception as e:
         print("dump 失败:", e)
     print("===== END =====\n")
 
 
 def _wait_ready(sb, timeout=45):
+    """等到页面不是 Cloudflare 挑战页，且正文有内容"""
     print("⏳ 等待页面…")
     for i in range(timeout):
         try:
             title = (sb.get_title() or "").lower()
             body = (sb.get_text("body") or "").strip()
-            if not ("just a moment" in title
-                    or "checking your browser" in title
-                    or "attention required" in title):
-                if len(body) > 80:
-                    print(f"✅ 已加载（{i+1}s）")
-                    return True
+            blocked = ("just a moment" in title
+                       or "checking your browser" in title
+                       or "attention required" in title
+                       or "请稍候" in title)
+            if not blocked and len(body) > 60:
+                print(f"✅ 已加载（{i+1}s）")
+                return True
         except Exception:
             pass
         time.sleep(1)
@@ -345,38 +373,140 @@ def _wait_ready(sb, timeout=45):
     return False
 
 
-def _pass_ad_wall(sb):
+AD_WALL_KWS = [
+    "view a short ad", "short ad", "site-wide access",
+    "watch ad", "sponsored", "continue to site",
+    "看广告", "广告", "访问权限",
+]
+
+
+def _body_text(sb):
     try:
-        txt = (sb.get_text("body") or "").lower()
+        return (sb.get_text("body") or "")
+    except Exception:
+        return ""
+
+
+def _has_login_form(sb):
+    """页面上有没有手机号输入框"""
+    try:
+        return bool(sb.execute_script("""
+        (function(){
+          var sels=['input[name="phone"]','input[id="phone"]','input[type="tel"]',
+                    'input[name="username"]','input[id="text"]','input[type="text"]'];
+          for(var i=0;i<sels.length;i++){
+            var el=document.querySelector(sels[i]);
+            if(el && el.offsetParent!==null) return true;
+          }
+          return false;})()
+        """))
     except Exception:
         return False
-    kws = ["view a short ad", "short ad", "site-wide access", "看广告"]
-    if not any(k in txt for k in kws):
-        return False
 
-    print("📺 广告墙，尝试点击…")
-    clicked = False
-    try:
-        for sel in ["button", "a", "span", "div[onclick]"]:
-            for el in sb.find_elements(sel):
-                try:
-                    t = (el.text or "").strip().lower()
-                    if any(k in t for k in kws):
-                        el.click()
-                        clicked = True
-                        print(f"🖱️  {t[:40]}")
+
+def _pass_ad_wall(sb, rounds: int = 3) -> bool:
+    """
+    广告墙：页面只有「View a short ad」之类的按钮，没有登录表单。
+    点掉后等页面出现真实表单。
+    """
+    any_clicked = False
+
+    for r in range(rounds):
+        txt = _body_text(sb).lower()
+        if not txt:
+            time.sleep(2)
+            txt = _body_text(sb).lower()
+
+        has_form = _has_login_form(sb)
+        has_kw = any(k in txt for k in AD_WALL_KWS)
+
+        if not has_kw and has_form:
+            return any_clicked
+
+        if not has_kw and not has_form:
+            # 既没关键词也没表单 —— 可能是 CF 或空页，交给上层处理
+            return any_clicked
+
+        print(f"📺 广告墙（第 {r+1} 轮），尝试点击…")
+
+        clicked = False
+
+        # 1) 按文本找可点元素（button / a / span / div / input[type=submit]）
+        try:
+            clicked = bool(sb.execute_script(r"""
+            (function(){
+              var kws=['view a short ad','short ad','site-wide access',
+                       'watch ad','sponsored','continue to site','看广告'];
+              var all=document.querySelectorAll('button,a,span,div,input[type=submit]');
+              for(var i=0;i<all.length;i++){
+                var el=all[i];
+                var t=(el.innerText||el.value||'').toLowerCase().trim();
+                if(!t) continue;
+                for(var k=0;k<kws.length;k++){
+                  if(t.indexOf(kws[k])>=0){
+                    try{ el.scrollIntoView({block:'center'}); }catch(e){}
+                    el.click();
+                    var ev=new MouseEvent('click',{bubbles:true,cancelable:true,view:window});
+                    el.dispatchEvent(ev);
+                    return true;
+                  }
+                }
+              }
+              return false;})()
+            """))
+        except Exception as e:
+            print(f"  ⚠️  JS 点击失败: {str(e)[:80]}")
+
+        # 2) 兜底：用 Selenium 逐个元素点
+        if not clicked:
+            try:
+                for sel in ["button", "a", "input[type=submit]"]:
+                    for el in sb.find_elements(sel):
+                        try:
+                            t = (el.text or "").strip().lower()
+                            if t and any(k in t for k in AD_WALL_KWS):
+                                el.click()
+                                clicked = True
+                                print(f"  🖱️  {t[:40]}")
+                                break
+                        except Exception:
+                            continue
+                    if clicked:
                         break
-                except Exception:
-                    continue
-            if clicked:
-                break
-    except Exception:
-        pass
+            except Exception:
+                pass
 
-    if clicked:
-        time.sleep(12)
-        _wait_ready(sb, 30)
-    return clicked
+        if clicked:
+            any_clicked = True
+            print("  ⏳ 等待广告跳转…")
+            # 广告可能开新标签
+            try:
+                handles = sb.driver.window_handles
+                if len(handles) > 1:
+                    print(f"  🔀 检测到 {len(handles)} 个标签页，切回第一个")
+                    sb.driver.switch_to.window(handles[0])
+                    for h in handles[1:]:
+                        try:
+                            sb.driver.switch_to.window(h)
+                            sb.driver.close()
+                        except Exception:
+                            pass
+                    sb.driver.switch_to.window(handles[0])
+            except Exception:
+                pass
+
+            time.sleep(10)
+            # 等表单出现
+            for _ in range(20):
+                if _has_login_form(sb):
+                    print("  ✅ 表单已出现")
+                    return True
+                time.sleep(1)
+        else:
+            print("  ⚠️  没找到可点元素")
+            time.sleep(3)
+
+    return any_clicked
 
 
 def _fill(sb, selectors, value, label):
@@ -428,11 +558,17 @@ def login(sb):
     time.sleep(5)
 
     _wait_ready(sb, 40)
-    _pass_ad_wall(sb)
+    _pass_ad_wall(sb, rounds=3)
 
     if _is_logged_in(sb):
         print("✅ 已有登录态")
         return True
+
+    # 广告墙没点掉时，这里会是空页面
+    if not _has_login_form(sb):
+        print("⚠️  仍然没有登录表单，再尝试一次广告墙…")
+        dump_page(sb, "before-adwall-retry")
+        _pass_ad_wall(sb, rounds=3)
 
     dump_page(sb, "login")
 
