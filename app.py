@@ -1071,6 +1071,15 @@ def _login_by_phone(sb, tg_wait: int) -> bool:
     return _wait_logged_in(sb, tg_wait, "登录")
 
 
+def _driver_alive(sb) -> bool:
+    """浏览器进程是否还活着"""
+    try:
+        _ = sb.driver.current_url
+        return True
+    except Exception:
+        return False
+
+
 def _login_by_telegram(sb, tg_wait: int) -> bool:
     """
     Telegram OAuth Widget 登录。
@@ -1141,6 +1150,11 @@ def _login_by_telegram(sb, tg_wait: int) -> bool:
 
     time.sleep(5)
 
+    if not _driver_alive(sb):
+        print("❌ 点击 widget 后浏览器崩溃")
+        send_tg("❌", "浏览器崩溃", "点击 Telegram 按钮后 Chrome 退出")
+        return False
+
     # ---- 检测是否开了新窗口 ----
     new_handle = None
     try:
@@ -1166,6 +1180,11 @@ def _login_by_telegram(sb, tg_wait: int) -> bool:
             time.sleep(1)
     except Exception as e:
         print(f"  ⚠️  窗口检测失败: {e}")
+        if not _driver_alive(sb):
+            print("❌ 浏览器已崩溃，无法继续")
+            send_tg("❌", "浏览器崩溃", "检测窗口时 Chrome 退出")
+            return False
+        print("  → 降级：在主窗口继续找表单")
 
     # ---- 在新窗口（或当前页）找手机号输入 ----
     print("🔎 查找手机号输入框…")
