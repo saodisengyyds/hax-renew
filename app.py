@@ -1,0 +1,773 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HH 自动续期
+
+登录：手机号 + 邮箱验证码
+续期：到期前 2 天自动执行
+
+环境变量
+--------
+必填
+  HH_SITE               站点地址，如 https://example.com
+  HH_PHONE              手机号
+  IMAP_HOST             邮箱 IMAP，如 imap.gmail.com
+  IMAP_PORT             默认 993
+  EMAIL_USER            收件邮箱
+  EMAIL_APP_PASSWORD    邮箱应用密码
+
+可选
+  MAIL_SUBJECT          验证码邮件的主题关键词，默认 "verification code"
+  NODE_LINK             代理节点
+  IS_PROXY / PROXY_SERVER
+  TG_BOT_TOKEN / TG_CHAT_ID
+  DUMP_PAGE=1           打印页面结构
+  FORCE_RENEW=1         忽略到期日，强制续期
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import base64
+import imaplib
+import email
+from email.header import decode_header
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timedelta, timezone
+
+import requests
+from seleniumbase import SB
+
+# ==================== 配置 ====================
+
+SITE = (os.environ.get("HH_SITE") or "").strip().rstrip("/")
+PHONE = (os.environ.get("HH_PHONE") or "").strip()
+
+IMAP_HOST = os.environ.get("IMAP_HOST") or ""
+IMAP_PORT = int(os.environ.get("IMAP_PORT") or "993")
+EMAIL_USER = os.environ.get("EMAIL_USER") or ""
+EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD") or ""
+
+MAIL_SUBJECT = os.environ.get("MAIL_SUBJECT") or "verification code"
+
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
+
+DUMP_PAGE = os.environ.get("DUMP_PAGE", "0").lower() in ("1", "true", "yes")
+FORCE_RENEW = os.environ.get("FORCE_RENEW", "0").lower() in ("1", "true", "yes")
+
+LOGIN_PATH = "/login"
+RENEW_PATH = "/vps-renew/"
+SITE_HOST = re.sub(r"^https?://", "", SITE).split("/")[0] if SITE else ""
+
+STATE_FILE = "hh_state.json"      # 记录到期日
+RENEW_AHEAD_DAYS = 2              # 提前几天续期
+
+CST = timezone(timedelta(hours=8))
+
+
+def now_cst():
+    return datetime.now(CST)
+
+
+def login_url():
+    return SITE + LOGIN_PATH
+
+
+def renew_url():
+    return SITE + RENEW_PATH
+
+
+# ==================== Telegram ====================
+
+def send_tg(status_icon: str, status_text: str, detail: str = ""):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("ℹ️  未配置 TG，跳过推送")
+        return
+    text = (
+        f"🟣 HH 续期通知\n\n"
+        f"{status_icon} {status_text}\n"
+        f"⏱️ {now_cst().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    if detail:
+        text += f"\n\n📄 {detail[:400]}"
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text},
+            timeout=15,
+        )
+        print("📩 TG 已发送" if r.status_code == 200
+              else f"⚠️  TG 失败: {r.status_code}")
+    except Exception as e:
+        print(f"⚠️  TG 异常: {e}")
+
+
+# ==================== 状态（到期日） ====================
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        return json.load(open(STATE_FILE, encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    try:
+        json.dump(state, open(STATE_FILE, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=2)
+        print(f"💾 已保存状态: {state}")
+    except Exception as e:
+        print(f"⚠️  保存状态失败: {e}")
+
+
+def parse_expiry(text: str):
+    """从页面文本里解析到期日，返回 date 或 None"""
+    if not text:
+        return None
+
+    pats = [
+        r"(?:expir\w*|renew\w*|到期|过期)[^\d]{0,30}(\d{4})[-/](\d{1,2})[-/](\d{1,2})",
+        r"(?:expir\w*|renew\w*|到期|过期)[^\d]{0,30}(\d{1,2})[-/](\d{1,2})[-/](\d{4})",
+        r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})",
+    ]
+
+    for i, pat in enumerate(pats):
+        m = re.search(pat, text, re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            if i == 1:
+                d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            else:
+                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            dt = datetime(y, mo, d).date()
+            today = now_cst().date()
+            if today <= dt <= today + timedelta(days=730):
+                return dt
+        except Exception:
+            continue
+    return None
+
+
+# ==================== 邮箱验证码 ====================
+
+def _decode_mime(s):
+    if not s:
+        return ""
+    out = []
+    for txt, enc in decode_header(s):
+        if isinstance(txt, bytes):
+            try:
+                out.append(txt.decode(enc or "utf-8", errors="ignore"))
+            except Exception:
+                out.append(txt.decode("utf-8", errors="ignore"))
+        else:
+            out.append(txt)
+    return "".join(out)
+
+
+# 验证码是一长串 base64（约 60 字符），解码后形如 手机号:::nonce
+_TOKEN_RE = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+
+
+def _extract_token(text: str):
+    """从邮件正文里提取验证令牌"""
+    if not text:
+        return None
+
+    # 去掉 HTML 标签和常见包裹符号
+    clean = re.sub(r"<[^>]+>", " ", text)
+
+    cands = _TOKEN_RE.findall(clean)
+    best = None
+    for c in cands:
+        # 排除纯数字、纯字母的偶然长串
+        if not re.search(r"[0-9]", c) or not re.search(r"[A-Za-z]", c):
+            continue
+        # 尝试解码，成功的更可信
+        try:
+            dec = base64.b64decode(c + "=" * (-len(c) % 4)).decode("utf-8")
+            if re.search(r"\d{6,}", dec):
+                return c
+            if best is None:
+                best = c
+        except Exception:
+            if best is None:
+                best = c
+    return best
+
+
+def fetch_code(max_wait: int = 180, interval: int = 8):
+    """轮询邮箱，取最新的验证码"""
+    if not (IMAP_HOST and EMAIL_USER and EMAIL_APP_PASSWORD):
+        print("❌ 未配置邮箱，无法取验证码")
+        return None
+
+    print(f"📬 轮询邮箱 {IMAP_HOST}，等待主题含「{MAIL_SUBJECT}」的邮件…")
+    deadline = time.time() + max_wait
+    seen = set()
+
+    while time.time() < deadline:
+        try:
+            M = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+            M.login(EMAIL_USER, EMAIL_APP_PASSWORD)
+            M.select("INBOX")
+
+            typ, data = M.search(None, "ALL")
+            if typ != "OK":
+                M.logout()
+                time.sleep(interval)
+                continue
+
+            for uid in reversed(data[0].split()[-25:]):
+                if uid in seen:
+                    continue
+                seen.add(uid)
+
+                typ, msg_data = M.fetch(uid, "(RFC822)")
+                if typ != "OK" or not msg_data or not msg_data[0]:
+                    continue
+
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject = _decode_mime(msg.get("Subject", ""))
+
+                # 按主题匹配
+                if MAIL_SUBJECT and MAIL_SUBJECT.lower() not in subject.lower():
+                    continue
+
+                # 只认 15 分钟内的
+                try:
+                    dh = msg.get("Date")
+                    if dh:
+                        dt = parsedate_to_datetime(dh)
+                        if dt.tzinfo:
+                            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                        if datetime.utcnow() - dt > timedelta(minutes=15):
+                            continue
+                except Exception:
+                    pass
+
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() in ("text/plain", "text/html"):
+                            try:
+                                p = part.get_payload(decode=True)
+                                if p:
+                                    body += p.decode(
+                                        part.get_content_charset() or "utf-8",
+                                        errors="ignore")
+                            except Exception:
+                                pass
+                else:
+                    try:
+                        p = msg.get_payload(decode=True)
+                        if p:
+                            body = p.decode(
+                                msg.get_content_charset() or "utf-8",
+                                errors="ignore")
+                    except Exception:
+                        pass
+
+                token = _extract_token(body)
+                if token:
+                    print(f"✅ 取到验证码: {token[:16]}…（{len(token)} 字符）")
+                    print(f"   主题: {subject}")
+                    M.logout()
+                    return token
+
+            M.logout()
+        except Exception as e:
+            print(f"⚠️  邮箱异常: {e}")
+
+        print(f"⏳ 暂无邮件，{interval}s 后重试…")
+        time.sleep(interval)
+
+    print("❌ 等待验证码超时")
+    return None
+
+
+# ==================== 页面工具 ====================
+
+def dump_page(sb, tag):
+    if not DUMP_PAGE:
+        return
+    print(f"\n===== DUMP [{tag}] =====")
+    try:
+        print(f"URL   : {sb.get_current_url()}")
+        print(f"TITLE : {sb.get_title()}")
+        info = sb.execute_script("""
+        (function(){
+          function d(el){return {tag:el.tagName.toLowerCase(),id:el.id||'',
+            name:el.getAttribute('name')||'',type:el.getAttribute('type')||'',
+            ph:el.getAttribute('placeholder')||'',
+            text:(el.innerText||el.value||'').trim().slice(0,40)};}
+          var o={inputs:[],buttons:[],forms:0};
+          document.querySelectorAll('input,textarea,select').forEach(function(e){
+            if(o.inputs.length<25)o.inputs.push(d(e));});
+          document.querySelectorAll('button,input[type=submit],a.btn').forEach(function(e){
+            if(o.buttons.length<25)o.buttons.push(d(e));});
+          o.forms=document.querySelectorAll('form').length;
+          return o;})()
+        """)
+        print("FORMS :", info.get("forms"))
+        for i in info.get("inputs", []):
+            print("  IN ", i)
+        for b in info.get("buttons", []):
+            print("  BTN", b)
+        print("TEXT  :", (sb.get_text("body") or "").replace("\n", " | ")[:700])
+    except Exception as e:
+        print("dump 失败:", e)
+    print("===== END =====\n")
+
+
+def _wait_ready(sb, timeout=45):
+    print("⏳ 等待页面…")
+    for i in range(timeout):
+        try:
+            title = (sb.get_title() or "").lower()
+            body = (sb.get_text("body") or "").strip()
+            if not ("just a moment" in title
+                    or "checking your browser" in title
+                    or "attention required" in title):
+                if len(body) > 80:
+                    print(f"✅ 已加载（{i+1}s）")
+                    return True
+        except Exception:
+            pass
+        time.sleep(1)
+    print("⚠️  可能未完全加载")
+    return False
+
+
+def _pass_ad_wall(sb):
+    try:
+        txt = (sb.get_text("body") or "").lower()
+    except Exception:
+        return False
+    kws = ["view a short ad", "short ad", "site-wide access", "看广告"]
+    if not any(k in txt for k in kws):
+        return False
+
+    print("📺 广告墙，尝试点击…")
+    clicked = False
+    try:
+        for sel in ["button", "a", "span", "div[onclick]"]:
+            for el in sb.find_elements(sel):
+                try:
+                    t = (el.text or "").strip().lower()
+                    if any(k in t for k in kws):
+                        el.click()
+                        clicked = True
+                        print(f"🖱️  {t[:40]}")
+                        break
+                except Exception:
+                    continue
+            if clicked:
+                break
+    except Exception:
+        pass
+
+    if clicked:
+        time.sleep(12)
+        _wait_ready(sb, 30)
+    return clicked
+
+
+def _fill(sb, selectors, value, label):
+    for sel in selectors:
+        try:
+            el = sb.find_element(sel, timeout=3)
+            if not el:
+                continue
+            try:
+                el.clear()
+            except Exception:
+                pass
+            el.click()
+            time.sleep(0.2)
+            el.send_keys(value)
+            print(f"✏️  {label} ({sel})")
+            return True
+        except Exception:
+            continue
+    print(f"❌ 找不到 {label}")
+    return False
+
+
+def _is_logged_in(sb):
+    try:
+        url = (sb.get_current_url() or "").lower()
+        if "/login" in url:
+            return False
+        body = (sb.get_text("body") or "").lower()
+        if re.search(r"logout|退出|sign out", body):
+            return True
+        if sb.execute_script(
+            "return !!document.querySelector('input[name=\"web_address\"],#web_address')"
+        ):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+# ==================== 登录 ====================
+
+def login(sb):
+    print(f"\n🌐 打开登录页: {login_url()}")
+    try:
+        sb.uc_open_with_reconnect(login_url(), reconnect_time=6)
+    except Exception:
+        sb.open(login_url())
+    time.sleep(5)
+
+    _wait_ready(sb, 40)
+    _pass_ad_wall(sb)
+
+    if _is_logged_in(sb):
+        print("✅ 已有登录态")
+        return True
+
+    dump_page(sb, "login")
+
+    # ---- 填手机号 ----
+    phone_sels = [
+        'input[name="phone"]', 'input[id="phone"]',
+        'input[type="tel"]', 'input[name="username"]',
+        'input[id="text"]', 'input[type="text"]',
+    ]
+    if not _fill(sb, phone_sels, PHONE, "手机号"):
+        dump_page(sb, "no-phone-input")
+        return False
+    time.sleep(1)
+
+    # ---- 提交手机号 ----
+    print("🖱️  提交手机号…")
+    sb.execute_script("""
+    (function(){
+      var bs = document.querySelectorAll('button,input[type=submit]');
+      for (var i=0;i<bs.length;i++){
+        var t = (bs[i].innerText||bs[i].value||'').toLowerCase();
+        if (/send|code|next|continue|login|submit|验证码|发送|下一步|登录/.test(t)){
+          bs[i].click(); return true;
+        }
+      }
+      var f = document.querySelector('form');
+      if (f) { f.submit(); return true; }
+      return false;
+    })()
+    """)
+    time.sleep(6)
+    _wait_ready(sb, 20)
+
+    # ---- 拿验证码 ----
+    token = fetch_code(max_wait=180, interval=8)
+    if not token:
+        send_tg("❌", "取不到验证码", "检查 IMAP 配置或邮件主题关键词")
+        return False
+
+    # ---- 填验证码 ----
+    code_sels = [
+        'input[name="code"]', 'input[id="code"]',
+        'input[name="token"]', 'input[id="token"]',
+        'input[name*="verify"]', 'input[id*="verify"]',
+        'input[name*="otp"]', 'input[id*="otp"]',
+        'input[type="text"]',
+    ]
+    if not _fill(sb, code_sels, token, "验证码"):
+        dump_page(sb, "no-code-input")
+        return False
+    time.sleep(1)
+
+    print("🖱️  提交验证码…")
+    sb.execute_script("""
+    (function(){
+      var bs = document.querySelectorAll('button,input[type=submit]');
+      for (var i=0;i<bs.length;i++){
+        var t = (bs[i].innerText||bs[i].value||'').toLowerCase();
+        if (/submit|verify|login|continue|确认|登录|验证/.test(t)){
+          bs[i].click(); return true;
+        }
+      }
+      var f = document.querySelector('form');
+      if (f) { f.submit(); return true; }
+      return false;
+    })()
+    """)
+
+    print("⏳ 等待登录结果…")
+    for i in range(25):
+        time.sleep(1)
+        _pass_ad_wall(sb)
+        if _is_logged_in(sb):
+            print(f"✅ 登录成功（{i+1}s）")
+            return True
+
+    dump_page(sb, "login-failed")
+    print("❌ 登录失败")
+    send_tg("❌", "登录失败", "请查看 Actions 日志")
+    return False
+
+
+# ==================== 续期 ====================
+
+def renew(sb):
+    print("\n" + "#" * 26)
+    print("   续期")
+    print("#" * 26)
+
+    print(f"\n🖥️  {renew_url()}")
+    try:
+        sb.uc_open_with_reconnect(renew_url(), reconnect_time=6)
+    except Exception:
+        sb.open(renew_url())
+    time.sleep(5)
+
+    _wait_ready(sb, 40)
+    _pass_ad_wall(sb)
+
+    if "/login" in (sb.get_current_url() or "").lower():
+        print("ℹ️  被重定向到登录页，先登录")
+        if not login(sb):
+            return False, None
+        sb.open(renew_url())
+        time.sleep(5)
+        _wait_ready(sb, 40)
+
+    dump_page(sb, "renew")
+
+    body = sb.get_text("body") or ""
+    low = body.lower()
+
+    if re.search(r"can'?t renew|cannot renew|not (yet )?time|无法续期|未到|too early", low):
+        print("⏳ 还没到续期时间")
+        d = parse_expiry(body)
+        send_tg("⏳", "未到续期时间", body[:300])
+        return True, d
+
+    if not sb.execute_script(
+        "return !!document.querySelector('input[name=\"web_address\"],#web_address')"
+    ):
+        print("❌ 找不到续期表单")
+        send_tg("❌", "找不到续期表单", body[:300])
+        return False, None
+
+    # 网站地址
+    print("✏️  填网站地址…")
+    sb.execute_script("""
+    (function(){
+      var el = document.querySelector('input[name="web_address"],#web_address');
+      if (!el) return false;
+      el.value='%s';
+      el.dispatchEvent(new Event('input',{bubbles:true}));
+      el.dispatchEvent(new Event('change',{bubbles:true}));
+      return true;})()
+    """ % SITE_HOST)
+    time.sleep(1)
+
+    # 协议
+    print("☑️  勾协议…")
+    sb.execute_script("""
+    (function(){
+      var ag = document.querySelector('input[name="agreement"]');
+      if (ag && !ag.checked){
+        ag.checked=true;
+        ag.dispatchEvent(new Event('change',{bubbles:true}));
+      }})()
+    """)
+    time.sleep(0.5)
+
+    # 验证码（如果页面要求）
+    need_code = sb.execute_script("""
+    (function(){
+      var sels=['input[name*="code"]','input[id*="code"]','input[name*="otp"]',
+                'input[id*="otp"]','input[name*="verify"]','input[id*="verify"]'];
+      for(var i=0;i<sels.length;i++){
+        var el=document.querySelector(sels[i]);
+        if(el && el.offsetParent!==null) return sels[i];
+      }
+      return null;})()
+    """)
+
+    if need_code:
+        print(f"🔐 需要验证码: {need_code}")
+        token = fetch_code(max_wait=180, interval=8)
+        if token:
+            _fill(sb, [need_code], token, "验证码")
+            time.sleep(1)
+
+    # 提交
+    print("🖱️  提交续期…")
+    submitted = False
+    try:
+        btn = sb.find_element('button[name="submit_button"]', timeout=5)
+        if btn:
+            sb.execute_script("""
+            (function(){
+              var b=document.querySelector('button[name="submit_button"]');
+              if(b) b.scrollIntoView({behavior:'smooth',block:'center'});})()
+            """)
+            time.sleep(0.8)
+            btn.click()
+            submitted = True
+    except Exception:
+        pass
+
+    if not submitted:
+        submitted = sb.execute_script("""
+        (function(){
+          var bs=document.querySelectorAll('button,input[type=submit]');
+          for(var i=0;i<bs.length;i++){
+            var t=(bs[i].innerText||bs[i].value||'').toLowerCase();
+            if(/renew|extend|续期/.test(t)){bs[i].click();return true;}
+          }
+          return false;})()
+        """)
+
+    if not submitted:
+        print("❌ 找不到提交按钮")
+        send_tg("❌", "找不到续期按钮", body[:300])
+        return False, None
+
+    print("⏳ 等待结果…")
+    time.sleep(8)
+    _pass_ad_wall(sb)
+
+    return _check_result(sb)
+
+
+def _check_result(sb):
+    print("\n📋 检查结果…")
+    body = ""
+    for _ in range(4):
+        try:
+            body = sb.get_text("body") or ""
+        except Exception:
+            body = ""
+        if body:
+            break
+        time.sleep(2)
+
+    low = body.lower()
+    expiry = parse_expiry(body)
+
+    if re.search(r"renewed|success|extended|已续期|成功|延长", low):
+        msg = "续期成功"
+        if expiry:
+            msg += f"\n📅 新到期日: {expiry}"
+        print(f"✅ {msg}")
+        send_tg("✅", msg, body[:300])
+        return True, expiry
+
+    if re.search(r"can'?t renew|cannot renew|not (yet )?time|未到|too early", low):
+        print("⏳ 未到续期时间")
+        send_tg("⏳", "未到续期时间", body[:300])
+        return True, expiry
+
+    if re.search(r"error|failed|失败|invalid|无效|expired|过期", low):
+        print("❌ 续期失败")
+        send_tg("❌", "续期失败", body[:300])
+        return False, expiry
+
+    print("❓ 结果不明确")
+    dump_page(sb, "result")
+    send_tg("❓", "结果不明确，请手动确认", body[:300])
+    return False, expiry
+
+
+# ==================== 入口 ====================
+
+def main():
+    print("#" * 26)
+    print("   HH 自动续期")
+    print("#" * 26)
+
+    missing = []
+    if not SITE:
+        missing.append("HH_SITE")
+    if not PHONE:
+        missing.append("HH_PHONE")
+    if missing:
+        print("❌ 缺少配置: " + " / ".join(missing))
+        sys.exit(2)
+
+    print(f"🌐 站点: {SITE}")
+
+    state = load_state()
+    expiry_str = state.get("expires")
+    today = now_cst().date()
+
+    # ---- 判断是否该续期 ----
+    if expiry_str and not FORCE_RENEW:
+        try:
+            exp = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+            days_left = (exp - today).days
+            print(f"📅 记录到期日: {exp}（还剩 {days_left} 天）")
+            if days_left > RENEW_AHEAD_DAYS:
+                print(f"⏭️  还没到提前 {RENEW_AHEAD_DAYS} 天的窗口，跳过")
+                print("   （要强制续期：设 FORCE_RENEW=1）")
+                sys.exit(0)
+            print(f"✅ 进入续期窗口（≤{RENEW_AHEAD_DAYS} 天）")
+        except Exception as e:
+            print(f"⚠️  状态文件异常，继续尝试续期: {e}")
+    elif FORCE_RENEW:
+        print("⚡ FORCE_RENEW=1，忽略到期日")
+    else:
+        print("ℹ️  没有到期日记录，本次先续期并记录")
+
+    is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
+    proxy_str = (os.environ.get("PROXY_SERVER") or "").strip() or "http://127.0.0.1:1081"
+    kw = {"uc": True, "headless": False}
+    if is_proxy:
+        print(f"🔗 代理: {proxy_str}")
+        kw["proxy"] = proxy_str
+    else:
+        print("🌐 直连")
+
+    ok = False
+    new_expiry = None
+
+    with SB(**kw) as sb:
+        try:
+            sb.open("https://api.ip.sb/ip")
+            print(f"📍 出口 IP: {(sb.get_text('body') or '').strip()}")
+        except Exception:
+            pass
+
+        try:
+            if not login(sb):
+                sys.exit(5)
+            ok, new_expiry = renew(sb)
+        except Exception as e:
+            print(f"❌ 异常: {e}")
+            import traceback
+            traceback.print_exc()
+            send_tg("❌", "运行异常", str(e)[:300])
+
+    # ---- 记录到期日 ----
+    if new_expiry:
+        state["expires"] = new_expiry.strftime("%Y-%m-%d")
+        state["updated"] = now_cst().strftime("%Y-%m-%d %H:%M:%S")
+        save_state(state)
+    elif ok and expiry_str:
+        # 续期成功但没解析到新日期，按 +7 天估算
+        try:
+            exp = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+            state["expires"] = (exp + timedelta(days=7)).strftime("%Y-%m-%d")
+            state["updated"] = now_cst().strftime("%Y-%m-%d %H:%M:%S")
+            save_state(state)
+            print(f"⚠️  未解析到新到期日，按 +7 天估算: {state['expires']}")
+        except Exception:
+            pass
+
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.png
+cookies.json
+config.json
+node_modules/

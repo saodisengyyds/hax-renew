@@ -1,0 +1,105 @@
+name: HH Auto Renew
+
+on:
+  schedule:
+    # 每天北京时间 09:10 检查一次
+    # 脚本自己判断：距到期 ≤2 天才续期，否则跳过
+    - cron: '10 1 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制续期（忽略到期日）'
+        required: false
+        default: 'false'
+
+jobs:
+  Renew-HH:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: write
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ⚙ 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 🛠️ 安装系统依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb x11-utils xdotool scrot fonts-noto-cjk
+
+      - name: 📦 安装 Python 依赖
+        run: |
+          pip install --no-cache-dir seleniumbase requests
+          seleniumbase install chromedriver
+
+      - name: ⚙ 设置代理（可选）
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          if [ -n "$NODE_LINK" ]; then
+            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          else
+            echo "未配置 NODE_LINK，直连"
+          fi
+
+      - name: 🚀 运行续期
+        env:
+          HH_SITE:            ${{ secrets.HH_SITE }}
+          HH_PHONE:           ${{ secrets.HH_PHONE }}
+          IMAP_HOST:          ${{ secrets.IMAP_HOST }}
+          IMAP_PORT:          ${{ secrets.IMAP_PORT }}
+          EMAIL_USER:         ${{ secrets.EMAIL_USER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          MAIL_SUBJECT:       ${{ secrets.MAIL_SUBJECT }}
+          TG_BOT_TOKEN:       ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:         ${{ secrets.TG_CHAT_ID }}
+          DUMP_PAGE:          ${{ secrets.DUMP_PAGE }}
+          FORCE_RENEW:        ${{ github.event.inputs.force || 'false' }}
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            python3 app.py
+
+      - name: 💾 提交到期日状态
+        if: always()
+        run: |
+          if [ -f hh_state.json ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add hh_state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: 更新到期日 $(cat hh_state.json | tr -d '\n')"
+              git push || true
+            fi
+          fi
+
+      - name: 📸 上传失败截图
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: '*.png'
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 🧹 清理旧运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 \
+            --json databaseId --jq '.[].databaseId' 2>/dev/null || true)
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 5 ]; then
+              gh run delete $run_id || true
+            fi
+          done
