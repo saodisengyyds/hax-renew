@@ -1313,49 +1313,83 @@ def renew(sb):
         send_tg("⏳", "未到续期时间", body[:300])
         return True, d
 
-    if not sb.execute_script(
-        "return !!document.querySelector('input[name=\"web_address\"],#web_address')"
-    ):
+    # 表单存在性检查用原生（该页 execute_script 常返回 None）
+    has_form = False
+    try:
+        el = sb.find_element('input[name="web_address"]', timeout=5)
+        has_form = bool(el and el.is_displayed())
+    except Exception:
+        try:
+            el = sb.find_element('#web_address', timeout=3)
+            has_form = bool(el and el.is_displayed())
+        except Exception:
+            has_form = False
+
+    if not has_form:
         print("❌ 找不到续期表单")
+        _step(sb, "renew-no-form")
         send_tg("❌", "找不到续期表单", body[:300])
         return False, None
+    print("  ✅ 续期表单已就位")
 
     # 网站地址
     print("✏️  填网站地址…")
-    sb.execute_script("""
-    (function(){
-      var el = document.querySelector('input[name="web_address"],#web_address');
-      if (!el) return false;
-      el.value='%s';
-      el.dispatchEvent(new Event('input',{bubbles:true}));
-      el.dispatchEvent(new Event('change',{bubbles:true}));
-      return true;})()
-    """ % SITE_HOST)
+    # 原生输入：这个页面 JS 执行不稳定（execute_script 常返回 None）
+    filled_addr = False
+    for sel in ['input[name="web_address"]', '#web_address']:
+        try:
+            el = sb.find_element(sel, timeout=3)
+            if el and el.is_displayed():
+                el.clear()
+                el.click()
+                el.send_keys(SITE_HOST)
+                filled_addr = True
+                print(f"  ✅ 已填 {SITE_HOST}（{sel}）")
+                break
+        except Exception:
+            continue
+    if not filled_addr:
+        print("  ⚠️  没填上网站地址，尝试 JS 兜底")
+        try:
+            sb.driver.execute_script(
+                "var e=document.querySelector('#web_address');if(e)e.value='%s';" % SITE_HOST)
+        except Exception:
+            pass
     time.sleep(1)
 
     # 协议
     print("☑️  勾协议…")
-    sb.execute_script("""
-    (function(){
-      var ag = document.querySelector('input[name="agreement"]');
-      if (ag && !ag.checked){
-        ag.checked=true;
-        ag.dispatchEvent(new Event('change',{bubbles:true}));
-      }})()
-    """)
+    checked = False
+    try:
+        ag = sb.find_element('input[name="agreement"]', timeout=3)
+        if ag:
+            if not ag.is_selected():
+                try:
+                    ag.click()
+                except Exception:
+                    # 被遮挡时点它的 label
+                    try:
+                        sb.find_element('label.form-check-label', timeout=2).click()
+                    except Exception:
+                        pass
+            checked = ag.is_selected()
+            print(f"  {'✅' if checked else '⚠️'} 协议勾选状态: {checked}")
+    except Exception as e:
+        print(f"  ⚠️  勾协议异常: {str(e)[:60]}")
     time.sleep(0.5)
 
-    # 验证码（如果页面要求）
-    need_code = sb.execute_script("""
-    (function(){
-      var sels=['input[name*="code"]','input[id*="code"]','input[name*="otp"]',
-                'input[id*="otp"]','input[name*="verify"]','input[id*="verify"]'];
-      for(var i=0;i<sels.length;i++){
-        var el=document.querySelector(sels[i]);
-        if(el && el.offsetParent!==null) return sels[i];
-      }
-      return null;})()
-    """)
+    # 验证码（如果页面要求）—— 原生查找
+    need_code = None
+    for sel in ['input[name*="code"]', 'input[id*="code"]',
+                'input[name*="otp"]', 'input[id*="otp"]',
+                'input[name*="verify"]', 'input[id*="verify"]']:
+        try:
+            el = sb.find_element(sel, timeout=1)
+            if el and el.is_displayed():
+                need_code = sel
+                break
+        except Exception:
+            continue
 
     if need_code:
         print(f"🔐 需要验证码: {need_code}")
@@ -1369,95 +1403,75 @@ def renew(sb):
     submitted = False
     reason = ""
 
-    # 等 Turnstile 拿到 token（页面是 cf-turnstile，有值才能提交）
+    # 这个页面 execute_script 经常返回 None，全部改用原生 Selenium 操作
+
+    # 1) 等 Turnstile token（原生读 value 属性）
     print("  ⏳ 等 Turnstile token…")
-    for _ in range(20):
+    token_ok = False
+    for i in range(20):
         try:
-            tv = sb.driver.execute_script("""
-            (function(){
-              var el = document.querySelector('input[name="cf-turnstile-response"]');
-              return el && el.value ? el.value.length : 0;
-            })()
-            """)
-            if tv and int(tv) > 20:
-                print(f"  ✅ Turnstile 已就绪（{tv} 字符）")
+            el = sb.find_element('input[name="cf-turnstile-response"]', timeout=2)
+            v = el.get_attribute("value") or ""
+            if len(v) > 20:
+                print(f"  ✅ Turnstile 就绪（{len(v)} 字符）")
+                token_ok = True
                 break
         except Exception:
             pass
         time.sleep(1)
-    else:
-        print("  ⚠️  Turnstile token 可能未就绪，仍尝试提交")
+    if not token_ok:
+        print("  ⚠️  Turnstile token 未就绪，仍尝试提交")
 
-    # 策略 1：直接调用页面自己的 onSubmit()（button 上有 data-callback="onSubmit"）
+    # 2) 找提交按钮（两个同名、无文本）
+    btns = []
     try:
-        r = sb.driver.execute_script("""
-        (function(){
-          if (typeof onSubmit === 'function') {
-            try { onSubmit(); return 'onSubmit'; }
-            catch(e){ return 'onSubmit_err:' + e.message; }
-          }
-          return '';
-        })()
-        """)
-        if r == 'onSubmit':
+        btns = sb.find_elements('button[name="submit_button"]')
+    except Exception:
+        pass
+    print(f"  找到 {len(btns)} 个 submit_button")
+
+    # 3) 依次尝试点击
+    for idx, b in enumerate(btns):
+        try:
+            if not b.is_displayed():
+                continue
+            # 滚到可视区
+            try:
+                sb.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", b)
+            except Exception:
+                pass
+            time.sleep(0.5)
+            try:
+                b.click()
+            except Exception:
+                # 被遮挡时用 ActionChains 坐标点
+                try:
+                    from selenium.webdriver.common.action_chains import ActionChains
+                    ActionChains(sb.driver).move_to_element(b).click().perform()
+                except Exception:
+                    continue
             submitted = True
-            reason = 'onSubmit()'
-        elif r:
-            reason = str(r)
-    except Exception as e:
-        reason = str(e)[:60]
+            reason = f"native_click[{idx}]"
+            print(f"  ✅ 点击按钮 #{idx}")
+            break
+        except Exception as e:
+            print(f"  ⚠️  按钮 #{idx} 点击失败: {str(e)[:60]}")
 
-    # 策略 2：JS 直接点按钮（绕过广告遮罩，按钮无文字所以不按文本找）
+    # 4) 兜底：提交表单
     if not submitted:
         try:
-            r = sb.driver.execute_script("""
-            (function(){
-              var bs = document.querySelectorAll('button[name="submit_button"]');
-              if (!bs.length) return 'no_button';
-              // 优先选没有 data-callback 的那个（普通提交）
-              var target = null;
-              for (var i = 0; i < bs.length; i++) {
-                if (!bs[i].hasAttribute('data-callback')) target = bs[i];
-              }
-              if (!target) target = bs[bs.length - 1];
-              target.scrollIntoView({block:'center'});
-              target.click();
-              target.dispatchEvent(new MouseEvent('click',
-                {bubbles:true, cancelable:true, view:window}));
-              return 'clicked';
-            })()
-            """)
-            if r == 'clicked':
+            f = sb.find_element('form#form-submit', timeout=3)
+            if f:
+                f.submit()
                 submitted = True
-                reason = 'js_click'
-            elif r:
-                reason = str(r)
+                reason = "form_submit"
+                print("  ✅ 直接提交表单")
         except Exception as e:
-            reason = str(e)[:60]
-
-    # 策略 3：表单直接提交
-    if not submitted:
-        try:
-            r = sb.driver.execute_script("""
-            (function(){
-              var f = document.getElementById('form-submit');
-              if (!f) return 'no_form';
-              if (typeof f.requestSubmit === 'function') {
-                f.requestSubmit(); return 'requestSubmit';
-              }
-              f.submit(); return 'form_submit';
-            })()
-            """)
-            if r in ('requestSubmit', 'form_submit'):
-                submitted = True
-                reason = r
-            elif r:
-                reason = str(r)
-        except Exception as e:
-            reason = str(e)[:60]
+            print(f"  ⚠️  表单提交失败: {str(e)[:60]}")
 
     if not submitted:
-        print(f"❌ 提交失败（{reason or '未知'}）")
+        print(f"❌ 提交失败（{reason or '所有方式都失败'}）")
         _step(sb, "renew-submit-fail")
         send_tg("❌", "续期提交失败", f"原因: {reason}\n{body[:200]}")
         return False, None
