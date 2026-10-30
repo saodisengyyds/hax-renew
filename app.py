@@ -599,57 +599,55 @@ def _pass_ad_wall(sb, rounds: int = 3) -> bool:
         if not has_wall:
             return any_clicked
 
-        print(f"📺 广告墙（第 {r+1} 轮），尝试点击…")
+        print(f"📺 广告墙（第 {r+1} 轮），尝试关闭…")
         clicked = False
 
-        # 1) 精确点 fc-rewarded-ad-button
+        # 1) 优先点 Dismiss（fc-cta-close）—— 不用看广告
         try:
-            btns = sb.find_elements("css selector", ".fc-rewarded-ad-button")
-            if btns:
-                btn = btns[0]
+            closes = sb.find_elements(
+                "css selector",
+                ".fc-cta-button.fc-cta-close, button[aria-label='Dismiss'], .fc-dialog-overlay .fc-cta-close")
+            if closes:
+                btn = closes[0]
                 sb.driver.execute_script(
                     "arguments[0].scrollIntoView({block:'center'});", btn)
-                time.sleep(0.5)
+                time.sleep(0.4)
                 try:
                     btn.click()
                 except Exception:
                     sb.driver.execute_script("arguments[0].click();", btn)
                 clicked = True
-                print("  🖱️  点击 .fc-rewarded-ad-button")
+                print("  🖱️  点击 Dismiss")
         except Exception as e:
-            print(f"  ⚠️  精确点击失败: {str(e)[:70]}")
+            print(f"  ⚠️  Dismiss 失败: {str(e)[:70]}")
 
-        # 2) 按文本找
+        # 2) Dismiss 不成就点「View a short ad」
         if not clicked:
             try:
-                for el in sb.find_elements("css selector",
-                                           ".fc-dialog-overlay button, .fc-message-root button"):
+                btns = sb.find_elements("css selector", ".fc-rewarded-ad-button")
+                if btns:
+                    btn = btns[0]
+                    sb.driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});", btn)
+                    time.sleep(0.4)
                     try:
-                        t = (el.text or "").lower()
-                        if "ad" in t or "access" in t or "continue" in t:
-                            el.click()
-                            clicked = True
-                            print(f"  🖱️  {t[:40]}")
-                            break
+                        btn.click()
                     except Exception:
-                        continue
-            except Exception:
-                pass
+                        sb.driver.execute_script("arguments[0].click();", btn)
+                    clicked = True
+                    print("  🖱️  点击 View a short ad")
+            except Exception as e:
+                print(f"  ⚠️  广告按钮失败: {str(e)[:70]}")
 
         # 3) JS 兜底
         if not clicked:
             try:
                 clicked = bool(sb.execute_script(r"""
                 (function(){
+                  var c=document.querySelector('.fc-cta-close,button[aria-label="Dismiss"]');
+                  if(c){ c.click(); return true; }
                   var b=document.querySelector('.fc-rewarded-ad-button');
                   if(b){ b.click(); return true; }
-                  var all=document.querySelectorAll('button');
-                  for(var i=0;i<all.length;i++){
-                    var t=(all[i].innerText||'').toLowerCase();
-                    if(t.indexOf('short ad')>=0||t.indexOf('site-wide')>=0){
-                      all[i].click(); return true;
-                    }
-                  }
                   return false;})()
                 """))
                 if clicked:
@@ -789,6 +787,215 @@ def login(sb, tg_wait: int = 300) -> bool:
         print("✅ 已有登录态")
         save_cookies(sb)
         return True
+
+    # ---- 情况 A：有手机号表单 ----
+    n_inputs = _count_inputs(sb)
+    print(f"🔎 页面 input 数量: {n_inputs}")
+
+    if n_inputs > 0:
+        print("→ 走手机号表单流程")
+        return _login_by_phone(sb, tg_wait)
+
+    # ---- 情况 B：没有 input，先尝试点 Login 链接 ----
+    print("→ 没有输入框，尝试点击 Login 入口…")
+    if _click_login_entry(sb):
+        # 等表单出现
+        for _ in range(20):
+            time.sleep(1)
+            if _count_inputs(sb) > 0:
+                print("  ✅ 表单已出现")
+                return _login_by_phone(sb, tg_wait)
+            _pass_ad_wall(sb, rounds=1)
+        print("  ⚠️  点了 Login 仍无表单")
+
+    # ---- 情况 C：Telegram widget ----
+    print("→ 尝试 Telegram widget 流程")
+    return _login_by_telegram(sb, tg_wait)
+
+
+def _click_login_entry(sb) -> bool:
+    """点页面上的 Login 入口（导航栏链接或按钮）"""
+    # 1) 找 href 含 login 的链接
+    try:
+        for el in sb.find_elements("css selector", "a[href*='login'], a[href*='Login']"):
+            try:
+                if el.is_displayed():
+                    el.click()
+                    print(f"  🖱️  点击链接: {el.get_attribute('href')}")
+                    time.sleep(4)
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 2) 按文本找
+    try:
+        for el in sb.find_elements("css selector", "a, button"):
+            try:
+                t = (el.text or "").strip().lower()
+                if t in ("login", "log in", "sign in", "登录"):
+                    if el.is_displayed():
+                        el.click()
+                        print(f"  🖱️  点击「{el.text.strip()}」")
+                        time.sleep(4)
+                        return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return False
+
+
+def _click_submit(sb):
+    """点提交按钮：选择器 → 文本 → 回车"""
+    try:
+        for sel in ['button[name="submit_button"]', 'button[type="submit"]',
+                    'input[type="submit"]']:
+            try:
+                btn = sb.find_element(sel, timeout=2)
+                if btn and btn.is_displayed():
+                    btn.click()
+                    print(f"  🖱️  {sel}")
+                    return True
+            except Exception:
+                continue
+
+        ok = sb.execute_script(r"""
+        (function(){
+          var bs=document.querySelectorAll('button,input[type=submit],a.btn');
+          for(var i=0;i<bs.length;i++){
+            var t=(bs[i].innerText||bs[i].value||'').toLowerCase();
+            if(/send|submit|verify|login|continue|next|confirm|验证码|发送|下一步|登录|确认/.test(t)){
+              bs[i].click(); return true;
+            }
+          }
+          return false;})()
+        """)
+        if ok:
+            print("  🖱️  按文本点击")
+            return True
+    except Exception:
+        pass
+
+    try:
+        for sel in ['input[type="text"]', 'input[type="tel"]',
+                    'input[type="password"]', 'input[type="email"]']:
+            try:
+                el = sb.find_element(sel, timeout=1)
+                if el and el.is_displayed():
+                    el.send_keys("\n")
+                    print("  ⌨️  回车提交")
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _wait_logged_in(sb, timeout: int, label: str = "登录") -> bool:
+    """轮询等待登录完成，成功后保存 cookie"""
+    print(f"\n⏳ 等待{label}完成（最多 {timeout}s）…")
+    send_tg("📲", "请在手机上确认登录",
+            f"hax 登录需要 Telegram 确认，请在 {timeout} 秒内点击")
+
+    deadline = time.time() + timeout
+    last_report = 0
+
+    while time.time() < deadline:
+        time.sleep(3)
+
+        # 多窗口情况（TG 授权可能开新标签）
+        try:
+            handles = sb.driver.window_handles
+            if len(handles) > 1:
+                cur = sb.driver.current_window_handle
+                for h in handles:
+                    if h != cur:
+                        sb.driver.switch_to.window(h)
+                        break
+        except Exception:
+            pass
+
+        if _is_logged_in(sb):
+            print(f"✅ {label}成功！")
+            try:
+                for h in sb.driver.window_handles:
+                    sb.driver.switch_to.window(h)
+                    if "hax.co.id" in (sb.get_current_url() or ""):
+                        break
+            except Exception:
+                pass
+            save_cookies(sb)
+            return True
+
+        remain = int(deadline - time.time())
+        if remain // 30 != last_report:
+            last_report = remain // 30
+            cur = ""
+            try:
+                cur = sb.get_current_url() or ""
+            except Exception:
+                pass
+            print(f"   等待中… 剩余 {remain}s  URL={cur[:70]}")
+
+    print(f"❌ {label}超时")
+    dump_page(sb, "login-timeout")
+    send_tg("⏰", f"{label}超时", "没有检测到登录成功")
+    return False
+
+
+def _login_by_phone(sb, tg_wait: int) -> bool:
+    """手机号 + 邮箱验证码登录"""
+    print("\n📱 手机号登录流程")
+
+    phone_sels = [
+        'input[name="phone"]', 'input[id="phone"]',
+        'input[type="tel"]', 'input[name="mobile"]',
+        'input[name="username"]', 'input[id="text"]',
+        'input[type="text"]', 'input[type="email"]',
+    ]
+    if not _fill(sb, phone_sels, PHONE, "手机号"):
+        dump_page(sb, "no-phone-input")
+        return False
+    time.sleep(1)
+
+    print("🖱️  提交手机号…")
+    _click_submit(sb)
+    time.sleep(6)
+    _wait_ready(sb, 20)
+    _pass_ad_wall(sb, rounds=2)
+
+    # 验证码
+    token = fetch_code(max_wait=180, interval=8)
+    if not token:
+        send_tg("❌", "取不到验证码", "检查 IMAP 配置或邮件主题关键词")
+        return False
+
+    code_sels = [
+        'input[name="code"]', 'input[id="code"]',
+        'input[name="token"]', 'input[id="token"]',
+        'input[name*="verify"]', 'input[id*="verify"]',
+        'input[name*="otp"]', 'input[id*="otp"]',
+        'input[type="text"]',
+    ]
+    if not _fill(sb, code_sels, token, "验证码"):
+        dump_page(sb, "no-code-input")
+        return False
+    time.sleep(1)
+
+    print("🖱️  提交验证码…")
+    _click_submit(sb)
+    time.sleep(5)
+
+    return _wait_logged_in(sb, tg_wait, "登录")
+
+
+def _login_by_telegram(sb, tg_wait: int) -> bool:
+    """Telegram OAuth Widget 登录"""
+    print("\n📲 Telegram Widget 登录流程")
 
     # ---- 找 Telegram 登录 widget ----
     print("🔎 查找 Telegram 登录按钮…")
