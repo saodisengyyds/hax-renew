@@ -1113,162 +1113,87 @@ def _login_by_telegram(sb, tg_wait: int) -> bool:
         return False
 
     # ---- 直接打开 Telegram 官方授权页（跳过 iframe，防止浏览器崩溃） ----
-    # ---- 在 iframe 内部点击（widget 必须嵌在父页面里才能工作）----
-    # 实测：单独打开 embed 页，点按钮无反应（它要 postMessage 给父页面）
-    print("🖱️  进入 iframe 点击登录按钮…")
+    print("🌐 直接导航至 Telegram 授权页…")
+    # Telegram OAuth 的 bot_id 必须是纯数字 ID (LoginHaxBot 的数字 ID 是 5938743585)
+    auth_url = f"https://oauth.telegram.org/auth?bot_id=5938743585&origin={SITE}&return_to={SITE}/login"
 
-    frame_idx = -1
+    print(f"  🔗 目标 URL: {auth_url}")
     try:
-        for i, ifr in enumerate(sb.find_elements("iframe")):
-            try:
-                s0 = ifr.get_attribute("src") or ""
-                fid = ifr.get_attribute("id") or ""
-                if "oauth.telegram.org" in s0 or "telegram-login" in fid:
-                    frame_idx = i
-                    break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    clicked = False
-    if frame_idx >= 0:
-        print(f"  📍 widget 在第 {frame_idx} 个 iframe")
-        try:
-            # 用索引切换：传元素会被 SeleniumBase 做 JSON 序列化而报错
-            sb.driver.switch_to.frame(frame_idx)
-            time.sleep(2)
-
-            for sel in ["button", "a", "div[role='button']",
-                        ".tgme_widget_login_button", ".tgme_widget_login_button_wrap"]:
-                try:
-                    for b in sb.find_elements("css selector", sel):
-                        try:
-                            if not b.is_displayed():
-                                continue
-                            txt = (b.text or "").strip()
-                            b.click()
-                            clicked = True
-                            print(f"  ✅ 点击 iframe 内「{txt[:30]}」")
-                            break
-                        except Exception:
-                            continue
-                except Exception:
-                    continue
-                if clicked:
-                    break
-
-            if not clicked:
-                # JS 兜底
-                clicked = bool(sb.driver.execute_script(r"""
-                (function(){
-                  var b=document.querySelector('.tgme_widget_login_button, button, a');
-                  if(b){ b.click(); return true; }
-                  return false;})()
-                """))
-                if clicked:
-                    print("  ✅ JS 点击 iframe 内按钮")
-        except Exception as e:
-            print(f"  ⚠️  iframe 内点击失败: {str(e)[:90]}")
-        finally:
-            try:
-                sb.driver.switch_to.default_content()
-            except Exception:
-                pass
-    else:
-        print("  ⚠️  没定位到 widget iframe")
-
-    if not clicked:
-        print("❌ 无法点击 Telegram 登录按钮")
-        send_tg("❌", "点击 Telegram 登录失败", "iframe 内找不到按钮")
-        return False
-
-    time.sleep(6)
-
-    if not _driver_alive(sb):
-        print("❌ 点击后浏览器崩溃")
-        send_tg("❌", "浏览器崩溃", "点击 Telegram 按钮后 Chrome 退出")
-        return False
-
-    # ---- 检测是否弹了新窗口 ----
-    new_handle = None
-    try:
-        for _ in range(12):
-            now_handles = set(sb.driver.window_handles)
-            added = now_handles - before_handles
-            if added:
-                new_handle = list(added)[0]
-                print(f"🔀 新窗口已弹出（共 {len(now_handles)} 个）")
-                sb.driver.switch_to.window(new_handle)
-                time.sleep(3)
-                print(f"   URL: {(sb.get_current_url() or '')[:90]}")
-                break
-            # 也可能同窗口内切换
-            for h in now_handles:
-                try:
-                    sb.driver.switch_to.window(h)
-                    u = sb.get_current_url() or ""
-                    if "oauth.telegram.org" in u and "/embed/" not in u:
-                        new_handle = h
-                        print(f"🔀 匹配到授权窗口: {u[:90]}")
-                        break
-                except Exception:
-                    continue
-            if new_handle:
-                break
-            time.sleep(1)
+        sb.open(auth_url)
     except Exception as e:
-        print(f"  ⚠️  窗口检测失败: {str(e)[:80]}")
-        if not _driver_alive(sb):
-            print("❌ 浏览器已崩溃")
-            send_tg("❌", "浏览器崩溃", "检测窗口时 Chrome 退出")
-            return False
+        print(f"⚠️  打开授权页异常: {e}")
 
-    if not new_handle:
-        print("⚠️  没弹出新窗口，在当前页继续找表单")
+    time.sleep(4)
+    _step(sb, "tg-oauth-page")
 
-    # ---- 找手机号输入 ----
-    print("🔎 查找手机号输入框…")
+    # ---- 找手机号输入并用 JS 直接赋值触发 ----
+    print("🔎 处理手机号输入与提交…")
     phone_filled = False
-    for attempt in range(15):
-        n = _count_inputs(sb)
-        if n > 0:
-            print(f"  ✅ 找到 {n} 个输入框（{attempt+1} 次尝试）")
-            _step(sb, "tg-popup-form")
-            break
-        time.sleep(2)
+    clean_phone = re.sub(r'[^0-9+]', '', PHONE)
+    # 分割国家代码和号码
+    country_code = "86"
+    number = clean_phone
+    if clean_phone.startswith("+"):
+        clean_phone = clean_phone[1:]
+    if clean_phone.startswith("86") and len(clean_phone) > 10:
+        country_code = "86"
+        number = clean_phone[2:]
+    elif clean_phone.startswith("1") and len(clean_phone) == 11:
+        # 如果是 1xx 开头的 11 位中国手机号
+        country_code = "86"
+        number = clean_phone
 
-    phone_sels = [
-        '#login-phone',
-        'input[name="phone"]', 'input[id="phone"]',
-        'input[type="tel"]', 'input[name="phone_number"]',
-        'input[placeholder*="phone"]', 'input[placeholder*="Phone"]',
-        'input[type="text"]',
-    ]
-    if _fill(sb, phone_sels, PHONE, "手机号"):
-        phone_filled = True
+    print(f"  📱 国家代码: +{country_code}, 号码: {number}")
+
+    # 用 JS 强力填入并直接调用 Telegram 官方的 requestConfirmation(event)
+    for attempt in range(15):
+        ok = sb.execute_script("""
+        (function(c, n){
+          var codeEl = document.getElementById('login-phone-code');
+          var phoneEl = document.getElementById('login-phone');
+          if (codeEl && phoneEl) {
+            codeEl.value = c;
+            phoneEl.value = n;
+            codeEl.dispatchEvent(new Event('input', {bubbles: true}));
+            codeEl.dispatchEvent(new Event('change', {bubbles: true}));
+            phoneEl.dispatchEvent(new Event('input', {bubbles: true}));
+            phoneEl.dispatchEvent(new Event('change', {bubbles: true}));
+            
+            // 直接触发官方提交函数
+            if (typeof requestConfirmation === 'function') {
+              requestConfirmation(null);
+              return 'submitted_by_fn';
+            }
+            var form = document.getElementById('send-form');
+            if (form) {
+              form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+              return 'submitted_by_form';
+            }
+            return 'filled';
+          }
+          return false;
+        })(arguments[0], arguments[1]);
+        """, country_code, number)
+
+        if ok:
+            print(f"  ✅ 成功填入并提交手机号: {ok}")
+            phone_filled = True
+            break
         time.sleep(1)
-        print("🖱️  提交手机号…")
-        # 优先点击 Telegram OAuth 的 Next 按钮
-        submitted_phone = False
-        try:
-            for btn_sel in ['button#check-button', 'button.btn', '.login-button', 'button[type="submit"]']:
-                b = sb.find_element(btn_sel, timeout=2)
-                if b and b.is_displayed():
-                    b.click()
-                    submitted_phone = True
-                    print(f"  ✅ 点击手机号提交按钮: {btn_sel}")
-                    break
-        except Exception:
-            pass
-        if not submitted_phone:
+
+    if not phone_filled:
+        phone_sels = [
+            '#login-phone',
+            'input[name="phone"]', 'input[id="phone"]',
+            'input[type="tel"]',
+        ]
+        if _fill(sb, phone_sels, number, "手机号"):
+            phone_filled = True
+            time.sleep(1)
             _click_submit(sb)
-        time.sleep(5)
-        _step(sb, "tg-phone-submitted")
-    else:
-        print("⚠️  没找到手机号输入框")
-        _step(sb, "tg-no-phone-input")
-        dump_page(sb, "tg-no-phone-input")
+
+    time.sleep(4)
+    _step(sb, "tg-phone-submitted")
 
     # ---- 通知 + 等确认 ----
     print("\n" + "=" * 52)
